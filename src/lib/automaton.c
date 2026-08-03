@@ -15,7 +15,7 @@
 // sequences to be coming in from the connected terminal, and everything else
 // is bulk input.
 
-// we assumed escapes can only be composed of 7-bit chars
+// we assume escapes can only be composed of 7-bit chars
 typedef struct esctrie {
   // if non-NULL, this is the next level of radix-128 trie. it is NULL on
   // accepting nodes, since no valid control sequence is a prefix of another

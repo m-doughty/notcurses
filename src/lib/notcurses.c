@@ -1166,7 +1166,7 @@ ncpixelimpl_e notcurses_check_pixel_support(const notcurses* nc){
 //  * creates and zeroes out the notcurses struct
 //  * ensures that we're using ASCII or UTF8 and calls setlocale(3)
 //  * checks the environment for NOTCURSES_LOGLEVEL and sets ret->loglevel
-//  * writes TERM to the environment, if specified via opts->termtype
+//  * sets TERM in the environment, if specified via opts->termtype
 //
 // iff we're using UTF8, |utf8| will be set to 1. it is otherwise set to 0.
 __attribute__ ((nonnull (2))) static notcurses*
@@ -3111,7 +3111,7 @@ get_blitter_egc_idx(const struct blitset* bset, const char* egc){
   if(sret == (size_t)-1 || sret == (size_t)-2){
     return -1;
   }
-  wchar_t* wptr = wcsrchr(bset->egcs, wc);
+  const wchar_t* wptr = wcsrchr(bset->egcs, wc);
   if(wptr == NULL){
 //fprintf(stderr, "FAILED TO FIND [%s] (%lc) in [%ls]\n", egc, wc, bset->egcs);
     return -1;
@@ -3235,8 +3235,8 @@ char* ncplane_contents(ncplane* nc, int begy, int begx, unsigned leny, unsigned 
   size_t retlen = 1;
   char* ret = malloc(retlen);
   if(ret){
-    for(unsigned y = ystart, targy = 0 ; y < ystart + leny ; ++y, targy += 2){
-      for(unsigned x = xstart, targx = 0 ; x < xstart + lenx ; ++x, ++targx){
+    for(unsigned y = ystart ; y < ystart + leny ; ++y){
+      for(unsigned x = xstart ; x < xstart + lenx ; ++x){
         nccell ncl = NCCELL_TRIVIAL_INITIALIZER;
         // we need ncplane_at_yx_cell() here instead of ncplane_at_yx(),
         // because we should only have one copy of each wide EGC.

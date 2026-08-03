@@ -33,7 +33,7 @@ name: fedora-rawhide
 
 steps:
 - name: fedora-rawhide
-  image: dankamongmen/rawhide:2021-11-14a
+  image: dankamongmen/rawhide:2026-05-18a
   commands:
     - export LANG=en_US.UTF-8
     - export TERM=xterm

@@ -25,6 +25,7 @@ jobs:
             doctest \
             ffmpeg \
             libunistring \
+            libdeflate \
             ncurses \
             pkg-config
 
@@ -46,7 +47,7 @@ jobs:
       - name: ctest
         run: |
           cd build
-          ctest -V --output-on-failure --stop-on-failure
+          ctest --output-on-failure --stop-on-failure
 
       - name: make install
         run: |
