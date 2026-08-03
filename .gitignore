@@ -21,3 +21,4 @@ rust/Cargo.lock
 *.swp
 *.swo
 *.xz
+.DS_Store
