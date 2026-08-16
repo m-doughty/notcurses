@@ -144,6 +144,31 @@ notcurses_data_path(const char* ddir, const char* f){
   return path;
 }
 
+// Allocate an image buffer that MUST remain releasable with plain free():
+// ncvisual data is freed by ncvisual_set_data(), ncvisual_destroy() and the
+// backend destroy hooks, all of which call free(). That rules out av_malloc()
+// (needs av_free(), which is _aligned_free() on MinGW), _aligned_malloc(), and
+// memalign(). posix_memalign()'s result IS free()-able, so prefer it; C11
+// aligned_alloc() would also qualify but is absent on UCRT.
+//
+// 'align' must be a power of two and a multiple of sizeof(void*). On Windows
+// there is no free()-compatible aligned allocator at all, so we fall back to
+// malloc()'s guarantee -- callers pad linesize to 'align' regardless, so rows
+// stay consistently aligned even there.
+static inline void*
+alloc_image_buffer(size_t align, size_t size){
+#ifdef __MINGW32__
+  (void)align;
+  return malloc(size);
+#else
+  void* ret = NULL;
+  if(posix_memalign(&ret, align, size)){
+    return NULL;
+  }
+  return ret;
+#endif
+}
+
 #ifdef __cplusplus
 }
 #else

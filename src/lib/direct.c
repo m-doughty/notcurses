@@ -10,6 +10,7 @@
 #include "notcurses/direct.h"
 #include "internal.h"
 #include "unixsig.h"
+#include "windows.h"
 
 // conform to the foreground and background channels of 'channels'
 static int
@@ -856,9 +857,16 @@ ncdirect_stop_minimal(void* vnc, void** altstack, int errret){
     if(cnorm && tty_emit(cnorm, nc->tcache.ttyfd)){
       ret = -1;
     }
+#ifndef __MINGW32__
     ret |= tcsetattr(nc->tcache.ttyfd, TCSANOW, nc->tcache.tpreserved);
+#else
+    ret |= restore_windows_console_input(&nc->tcache);
+#endif
   }
   ret |= ncdirect_flush(nc);
+#ifdef __MINGW32__
+  ret |= restore_windows_console(&nc->tcache);
+#endif
 #ifndef __MINGW32__
   del_curterm(cur_term);
 #endif
@@ -945,9 +953,13 @@ ncdirect* ncdirect_core_init(const char* termtype, FILE* outfp, uint64_t flags){
 
 err:{
     void* altstack;
+#ifndef __MINGW32__
     if(ret->tcache.ttyfd >= 0){
       (void)tcsetattr(ret->tcache.ttyfd, TCSANOW, ret->tcache.tpreserved);
     }
+#else
+    (void)restore_windows_console(&ret->tcache);
+#endif
     drop_signals(ret, &altstack);
     pthread_mutex_destroy(&ret->stats.lock);
     free(ret);

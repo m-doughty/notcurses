@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <fcntl.h>
+#include <stdatomic.h>
 #include <unistd.h>
 #include "automaton.h"
 #include "internal.h"
@@ -94,6 +95,15 @@ typedef struct inputctx {
   unsigned midescape; // we're in the middle of a potential escape. we need
                       //  to do a nonblocking read and try to complete it.
   unsigned stdineof;  // have we seen an EOF on stdin?
+  _Atomic bool stopping; // cooperative shutdown (required on Windows)
+#ifdef __MINGW32__
+  // Consecutive console polls that found no byte-producing key-down record.
+  // Drives a backoff in block_on_input(); see the comment there.
+  unsigned nokeydown_polls;
+  // Is stdinhandle a real console? If not (redirected file/pipe) there are no
+  // INPUT_RECORDs to peek at, and block_on_input() must not gate reads on them.
+  bool stdinconsole;
+#endif
 
   unsigned linesigs;  // are line discipline signals active?
   unsigned drain;     // drain away bulk input?
@@ -108,6 +118,13 @@ typedef struct inputctx {
   // been taken, both become NULL.
   struct initial_responses* initdata;
   struct initial_responses* initdata_complete;
+  // Terminal interrogation is opportunistic: a terminal or multiplexer can
+  // omit, fragment, or interleave a reply in a way the response automaton
+  // cannot classify.  The thread waiting in inputlayer_get_responses() asks
+  // the input thread to hand off the partial result after a bounded wait.
+  // Only the input thread moves initdata, so late parser callbacks cannot race
+  // a waiter freeing the response structure.
+  _Atomic bool initdata_timeout;
   int kittykbd;        // kitty keyboard protocol support level
   bool failed;         // error initializing input automaton, abort
 } inputctx;
@@ -462,18 +479,23 @@ send_synth_signal(int sig){
 
 static void
 mark_pipe_ready(ipipe pipes[static 2]){
+#ifdef __MINGW32__
+  // Every Windows wake handle is an auto-reset event (see getwakepipes()):
+  // an anonymous pipe read handle is not a waitable object, so a pipe-based
+  // wake leaves WaitForMultipleObjects() blocked and is silently inert.
+  if(!SetEvent(pipes[0])){
+    logwarn("error signalling wake event");
+  }else{
+    loginfo("signalled wake event");
+  }
+#else
   char sig = 1;
-#ifndef __MINGW32__
   if(write(pipes[1], &sig, sizeof(sig)) != 1){
     logwarn("error writing to pipe (%d) (%s)", pipes[1], strerror(errno));
-#else
-  DWORD wrote;
-  if(!WriteFile(pipes[1], &sig, sizeof(sig), &wrote, NULL) || wrote != sizeof(sig)){
-    logwarn("error writing to pipe");
-#endif
   }else{
     loginfo("wrote to readiness pipe");
   }
+#endif
 }
 
 // shove the assembled input |tni| into the input queue (if there's room, and
@@ -1211,6 +1233,26 @@ handoff_initial_responses_late(inputctx* ictx){
 }
 
 
+// Force the handoff of whatever interrogation results we have, for the case
+// where the terminal never supplied a classifiable reply. Unlike the
+// early/late pair, the decision is made under ilock, so this can neither race
+// a waiter nor overwrite a completed-but-unclaimed response with NULL.
+static void
+handoff_initial_responses_timeout(inputctx* ictx){
+  bool sig = false;
+  pthread_mutex_lock(&ictx->ilock);
+  if(ictx->initdata){
+    ictx->initdata_complete = ictx->initdata;
+    ictx->initdata = NULL;
+    sig = true;
+  }
+  pthread_mutex_unlock(&ictx->ilock);
+  if(sig){
+    pthread_cond_broadcast(&ictx->icond);
+    logwarn("terminal interrogation timed out; using partial responses");
+  }
+}
+
 // mark the initdata as complete, but don't yet broadcast it off.
 static void
 handoff_initial_responses_early(inputctx* ictx){
@@ -1917,9 +1959,11 @@ endpipes(ipipe pipes[static 2]){
 }
 
 // only linux and freebsd13+ have eventfd(), so we'll fall back to pipes sigh.
+// POSIX only: every Windows caller wants a waitable handle, so it goes through
+// getwakepipes() below instead.
+#ifndef __MINGW32__
 static int
 getpipes(ipipe pipes[static 2]){
-#ifndef __MINGW32__
 #ifndef __APPLE__
   if(pipe2(pipes, O_CLOEXEC | O_NONBLOCK)){
     logerror("couldn't get pipes (%s)", strerror(errno));
@@ -1941,13 +1985,30 @@ getpipes(ipipe pipes[static 2]){
     return -1;
   }
 #endif
-#else // windows
-  if(!CreatePipe(&pipes[0], &pipes[1], NULL, BUFSIZ)){
-    logerror("couldn't get pipes");
+  return 0;
+}
+#endif
+
+// A wake handle: written by one thread purely to break another out of its
+// blocking wait. On Windows this must NOT be a CreatePipe() pair --
+// WaitForMultipleObjects() never signals on an anonymous pipe read handle, so
+// a pipe-based wake is silently inert and the input thread stays blocked
+// through both shutdown and the terminal-interrogation timeout. Use an
+// auto-reset event instead; the write end stays NULL so endpipes() has nothing
+// to close. POSIX keeps the pipe, since its read end must stay poll()able
+// alongside the input descriptors.
+static int
+getwakepipes(ipipe pipes[static 2]){
+#ifndef __MINGW32__
+  return getpipes(pipes);
+#else
+  pipes[1] = NULL;
+  if((pipes[0] = CreateEvent(NULL, FALSE, FALSE, NULL)) == NULL){
+    logerror("couldn't create wake event");
     return -1;
   }
-#endif
   return 0;
+#endif
 }
 
 static inline inputctx*
@@ -1967,8 +2028,11 @@ create_inputctx(tinfo* ti, FILE* infp, int lmargin, int tmargin, int rmargin,
               if(pthread_condmonotonic_init(&i->ccond) == 0){
                 if((i->stdinfd = fileno(infp)) >= 0){
                   if( (i->initdata = malloc(sizeof(*i->initdata))) ){
-                    if(getpipes(i->readypipes) == 0){
-                      if(getpipes(i->ipipes) == 0){
+                    // readypipes is a wake handle too: on Windows nothing ever
+                    // drains it (see internal_get()), so a real pipe would fill
+                    // its BUFSIZ buffer and then block mark_pipe_ready forever.
+                    if(getwakepipes(i->readypipes) == 0){
+                      if(getwakepipes(i->ipipes) == 0){
                         memset(&i->amata, 0, sizeof(i->amata));
                         if(prep_special_keys(i) == 0){
                           if(set_fd_nonblocking(i->stdinfd, 1, &ti->stdio_blocking_save) == 0){
@@ -1993,8 +2057,19 @@ create_inputctx(tinfo* ti, FILE* infp, int lmargin, int tmargin, int rmargin,
                             i->stats = stats;
                             i->ti = ti;
                             i->stdineof = 0;
+                            i->stopping = false;
+                            i->initdata_timeout = false;
 #ifdef __MINGW32__
+                            i->nokeydown_polls = 0;
                             i->stdinhandle = ti->inhandle;
+                            {
+                              DWORD cmode;
+                              i->stdinconsole = i->stdinhandle
+                                && i->stdinhandle != INVALID_HANDLE_VALUE
+                                && GetConsoleMode(i->stdinhandle, &cmode);
+                              loginfo("windows stdin is %s",
+                                      i->stdinconsole ? "a console" : "redirected");
+                            }
 #endif
                             i->ibufvalid = 0;
                             i->linesigs = linesigs_enabled;
@@ -2197,6 +2272,48 @@ read_input_nblock(int fd, unsigned char* buf, size_t buflen, int *bufused,
   space -= r;
   loginfo("read %" PRIdPTR "B from %d (%" PRIuPTR "B left)", r, fd, space);
 }
+
+#ifdef __MINGW32__
+// Read the VT byte stream from a Windows console without passing it through
+// the CRT's text-mode console buffering. We only call this after
+// block_on_input() has observed a queued key-down record, so ReadFile should
+// have bytes available immediately. The owning input thread can still be
+// interrupted during shutdown with CancelSynchronousIo if the console races.
+// Sets ictx->stdineof on end-of-stream; read_inputs_nblock() turns that into
+// the readiness/broadcast handoff, exactly as it does for the POSIX reader.
+static void
+read_windows_console(inputctx* ictx){
+  size_t space = sizeof(ictx->ibuf) - ictx->ibufvalid;
+  if(space == 0){
+    return;
+  }
+  DWORD got = 0;
+  if(!ReadFile(ictx->stdinhandle, ictx->ibuf + ictx->ibufvalid,
+               (DWORD)space, &got, NULL)){
+    DWORD err = GetLastError();
+    // a cancelled read is our own shutdown, not a broken stream
+    if(err == ERROR_OPERATION_ABORTED){
+      return;
+    }
+    // a redirected stdin whose writer went away reports one of these rather
+    // than a zero-length read; either way the stream is finished.
+    if(err == ERROR_BROKEN_PIPE || err == ERROR_HANDLE_EOF){
+      loginfo("end of input stream (%lu)", (unsigned long)err);
+      ictx->stdineof = 1;
+      return;
+    }
+    logerror("error reading Windows console (%lu)", (unsigned long)err);
+    return;
+  }
+  if(got == 0){
+    // a successful synchronous read of zero bytes is end-of-file
+    loginfo("end of input stream");
+    ictx->stdineof = 1;
+    return;
+  }
+  ictx->ibufvalid += (int)got;
+}
+#endif
 
 // are terminal and stdin distinct for this inputctx?
 static inline bool
@@ -2499,28 +2616,88 @@ block_on_input(inputctx* ictx, unsigned* rtfd, unsigned* rifd){
   int timeoutms = nonblock ? 0 : -1;
   DWORD ncount = 0;
   HANDLE handles[2];
+  DWORD stdinidx = (DWORD)-1;
   if(!ictx->stdineof){
     if(ictx->ibufvalid != sizeof(ictx->ibuf)){
+      stdinidx = ncount;
       handles[ncount++] = ictx->stdinhandle;
     }
   }
-  if(ncount == 0){
-    handles[ncount++] = ictx->ipipes[0];
-  }
+  DWORD pipeidx = ncount;
+  handles[ncount++] = ictx->ipipes[0];
   DWORD d = WaitForMultipleObjects(ncount, handles, false, timeoutms);
   if(d == WAIT_TIMEOUT){
     return 0;
   }else if(d == WAIT_FAILED){
     return -1;
-  }else if(d - WAIT_OBJECT_0 == 0){
-    *rifd = 1;
-    return 1;
+  }
+  DWORD readyidx = d - WAIT_OBJECT_0;
+  if(readyidx == stdinidx){
+    // Redirected stdin (file or pipe) has no INPUT_RECORD queue at all, so
+    // PeekConsoleInputW() below would fail forever and we would never read a
+    // byte. Signalled means readable here; go straight to the reader, which
+    // also lets it observe end-of-stream and set stdineof.
+    if(!ictx->stdinconsole){
+      *rifd = 1;
+      return 1;
+    }
+    // A console handle is signalled for key-up, mouse, focus, and other
+    // INPUT_RECORDs which produce no bytes in VT input mode. On Windows our
+    // set_fd_nonblocking() compatibility function is a no-op, so calling the
+    // CRT read() for one of those records blocks until a later key-down. That
+    // makes the byte stream appear one physical keypress behind (most visibly
+    // as an Enter which only takes effect after the next Enter).
+    //
+    // Inspect, but never consume, the console queue: the CRT byte reader must
+    // remain its sole owner. It will discard the preceding non-byte records
+    // when a key-down capable of producing VT input is actually queued.
+    INPUT_RECORD records[256];
+    DWORD available = 0;
+    bool has_keydown = false;
+    if(PeekConsoleInputW(ictx->stdinhandle, records,
+                         sizeof(records) / sizeof(*records), &available)){
+      for(DWORD idx = 0 ; idx < available ; ++idx){
+        if(records[idx].EventType == 0x0001 && // KEY_EVENT
+           records[idx].Event.KeyEvent.bKeyDown){
+          has_keydown = true;
+          break;
+        }
+      }
+    }
+    if(has_keydown){
+      ictx->nokeydown_polls = 0;
+      *rifd = 1;
+      return 1;
+    }
+    if(WaitForSingleObject(ictx->ipipes[0], 0) == WAIT_OBJECT_0){
+      return 0;
+    }
+    // The handle stays signalled for as long as the non-byte records remain
+    // queued, and we deliberately never consume them, so this cannot be a
+    // blocking wait. A key-up left behind by the last keystroke would
+    // otherwise pin us at a 500Hz poll for as long as the app is idle. Back
+    // off to 16ms -- under one frame at 60Hz, so the first key after an idle
+    // period is not perceptibly late -- and drop straight back to 1ms as soon
+    // as a key-down arrives.
+    if(ictx->nokeydown_polls < 32){
+      ++ictx->nokeydown_polls;
+    }
+    DWORD naptime = ictx->nokeydown_polls < 8 ? 1
+                    : ictx->nokeydown_polls < 32 ? 4 : 16;
+    Sleep(naptime);
+    return 0;
+  }else if(readyidx == pipeidx){
+    return 0;
   }
   return -1;
 #else
   // do *not* use POLLRDHUP; it is not necessary, and causes trouble on BSD
   const int inevents = POLLIN;
-  struct pollfd pfds[2];
+  // stdin, an optional distinct controlling terminal, and the internal wake
+  // pipe can all be live at once.  The wake pipe must always be polled: it is
+  // how shutdown and a bounded terminal-interrogation timeout wake this
+  // otherwise indefinitely-blocked input thread.
+  struct pollfd pfds[3];
   int pfdcount = 0;
   if(!ictx->stdineof){
     if(ictx->ibufvalid != sizeof(ictx->ibuf)){
@@ -2530,13 +2707,10 @@ block_on_input(inputctx* ictx, unsigned* rtfd, unsigned* rifd){
       ++pfdcount;
     }
   }
-  if(pfdcount == 0){
-    loginfo("output queues full; blocking on ipipes");
-    pfds[pfdcount].fd = ictx->ipipes[0];
-    pfds[pfdcount].events = inevents;
-    pfds[pfdcount].revents = 0;
-    ++pfdcount;
-  }
+  pfds[pfdcount].fd = ictx->ipipes[0];
+  pfds[pfdcount].events = inevents;
+  pfds[pfdcount].revents = 0;
+  ++pfdcount;
   if(ictx->termfd >= 0){
     pfds[pfdcount].fd = ictx->termfd;
     pfds[pfdcount].events = inevents;
@@ -2608,9 +2782,15 @@ read_inputs_nblock(inputctx* ictx){
   // was not a distinct terminal source).
   if(rifd){
     unsigned eof = ictx->stdineof;
+#ifdef __MINGW32__
+    read_windows_console(ictx);
+#else
     read_input_nblock(ictx->stdinfd, ictx->ibuf, sizeof(ictx->ibuf),
                       &ictx->ibufvalid, &ictx->stdineof);
-    // did we switch from non-EOF state to EOF? if so, mark us ready
+#endif
+    // did we switch from non-EOF state to EOF? if so, mark us ready. both
+    // readers set stdineof, so this transition is handled identically on
+    // every platform.
     if(!eof && ictx->stdineof){
       // we hit EOF; write an event to the readiness fd
       mark_pipe_ready(ictx->readypipes);
@@ -2628,10 +2808,13 @@ input_thread(void* vmarshall){
     handoff_initial_responses_early(ictx);
     handoff_initial_responses_late(ictx);
   }
-  for(;;){
+  while(!atomic_load(&ictx->stopping)){
     read_inputs_nblock(ictx);
     // process anything we've read
     process_ibuf(ictx);
+    if(atomic_exchange(&ictx->initdata_timeout, false)){
+      handoff_initial_responses_timeout(ictx);
+    }
   }
   return NULL;
 }
@@ -2656,16 +2839,21 @@ int init_inputlayer(tinfo* ti, FILE* infp, int lmargin, int tmargin,
 int stop_inputlayer(tinfo* ti){
   int ret = 0;
   if(ti){
-    // FIXME cancellation on shutdown does not yet work on windows #2192
-#ifndef __MINGW32__
     if(ti->ictx){
       loginfo("tearing down input thread");
+#ifdef __MINGW32__
+      // no pthread_cancel on windows: ask the thread to stop, then wake it out
+      // of its blocking wait via the ipipes event.
+      atomic_store(&ti->ictx->stopping, true);
+      mark_pipe_ready(ti->ictx->ipipes);
+      ret |= pthread_join(ti->ictx->tid, NULL);
+#else
       ret |= cancel_and_join("input", ti->ictx->tid, NULL);
+#endif
       ret |= set_fd_nonblocking(ti->ictx->stdinfd, ti->stdio_blocking_save, NULL);
       free_inputctx(ti->ictx);
       ti->ictx = NULL;
     }
-#endif
   }
   return ret;
 }
@@ -2921,9 +3109,35 @@ int notcurses_linesigs_enable(notcurses* n){
 
 struct initial_responses* inputlayer_get_responses(inputctx* ictx){
   struct initial_responses* iresp;
+  struct timespec deadline;
+  // icond is created with pthread_condmonotonic_init(), so its absolute
+  // deadlines must use the same clock.  A CLOCK_REALTIME deadline would be
+  // interpreted as an effectively decades-long CLOCK_MONOTONIC timeout.
+  bool have_deadline = clock_gettime(CLOCK_MONOTONIC, &deadline) == 0;
+  if(have_deadline){
+    ++deadline.tv_sec;
+  }
   pthread_mutex_lock(&ictx->ilock);
   while(ictx->initdata || !ictx->initdata_complete){
-    pthread_cond_wait(&ictx->icond, &ictx->ilock);
+    if(!have_deadline){
+      pthread_cond_wait(&ictx->icond, &ictx->ilock);
+      continue;
+    }
+    int r = pthread_cond_timedwait(&ictx->icond, &ictx->ilock, &deadline);
+    if(r == ETIMEDOUT && (ictx->initdata || !ictx->initdata_complete)){
+      atomic_store(&ictx->initdata_timeout, true);
+      // Wake block_on_input(); the input thread performs the handoff after
+      // finishing any buffer it already owns.
+      mark_pipe_ready(ictx->ipipes);
+      // Re-arm rather than falling back to an unbounded wait: a single request
+      // can be missed if the input thread was mid-read, and an unbounded wait
+      // would then hang here forever.
+      if(clock_gettime(CLOCK_MONOTONIC, &deadline)){
+        have_deadline = false;
+      }else{
+        ++deadline.tv_sec;
+      }
+    }
   }
   iresp = ictx->initdata_complete;
   ictx->initdata_complete = NULL;

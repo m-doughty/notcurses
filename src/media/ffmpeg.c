@@ -255,16 +255,24 @@ force_rgba(ncvisual* n){
 //fprintf(stderr, "Error retrieving details->rgbactx\n");
     return -1;
   }
-  memcpy(sframe, inf, sizeof(*inf));
   sframe->format = targformat;
   sframe->width = inf->width;
   sframe->height = inf->height;
-  int size = av_image_alloc(sframe->data, sframe->linesize,
-                            sframe->width, sframe->height,
-                            sframe->format,
-                            IMGALLOCALIGN);
+  int size = av_image_get_buffer_size(sframe->format, sframe->width,
+                                      sframe->height, IMGALLOCALIGN);
   if(size < 0){
 //fprintf(stderr, "Error allocating visual data (%d X %d)\n", sframe->height, sframe->width);
+    av_frame_free(&sframe);
+    return -1;
+  }
+  // must be free()-able: this becomes ncv->data via ncvisual_set_data() below
+  uint8_t* rgba = alloc_image_buffer(IMGALLOCALIGN, size);
+  if(rgba == NULL || av_image_fill_arrays(sframe->data, sframe->linesize,
+                                           rgba, sframe->format,
+                                           sframe->width, sframe->height,
+                                           IMGALLOCALIGN) < 0){
+    free(rgba);
+    av_frame_free(&sframe);
     return -1;
   }
 //fprintf(stderr, "INFRAME DAA: %p SDATA: %p FDATA: %p\n", inframe->data[0], sframe->data[0], ncv->details->frame->data[0]);
@@ -273,25 +281,21 @@ force_rgba(ncvisual* n){
                          sframe->linesize);
   if(height < 0){
 //fprintf(stderr, "Error applying converting %d\n", inf->format);
+    free(rgba);
     av_frame_free(&sframe);
     return -1;
   }
   int bpp = av_get_bits_per_pixel(av_pix_fmt_desc_get(sframe->format));
   if(bpp != 32){
 //fprintf(stderr, "Bad bits-per-pixel (wanted 32, got %d)\n", bpp);
+    free(rgba);
     av_frame_free(&sframe);
     return -1;
   }
   n->rowstride = sframe->linesize[0];
   if((uint32_t*)sframe->data[0] != n->data){
 //fprintf(stderr, "SETTING UP RESIZE %p\n", n->data);
-    if(n->details->frame){
-      if(n->owndata){
-        // we don't free the frame data here, because it's going to be
-        // freed (if appropriate) by ncvisual_set_data() momentarily.
-        av_freep(&n->details->frame);
-      }
-    }
+    av_frame_free(&n->details->frame);
     ncvisual_set_data(n, sframe->data[0], true);
   }
   n->details->frame = sframe;
@@ -604,9 +608,17 @@ ffmpeg_resize_internal(const ncvisual* ncv, int rows, int* stride, int cols,
   // necessitated by ffmpeg AVPicture API
   uint8_t* dptrs[4];
   int dlinesizes[4];
-  int size = av_image_alloc(dptrs, dlinesizes, cols, rows, targformat, IMGALLOCALIGN);
+  int size = av_image_get_buffer_size(targformat, cols, rows, IMGALLOCALIGN);
   if(size < 0){
 //fprintf(stderr, "Error allocating visual data (%d X %d)\n", sframe->height, sframe->width);
+    return NULL;
+  }
+  // must be free()-able: ffmpeg_blit() releases this with free()
+  uint8_t* scaled = alloc_image_buffer(IMGALLOCALIGN, size);
+  if(scaled == NULL || av_image_fill_arrays(dptrs, dlinesizes, scaled,
+                                             targformat, cols, rows,
+                                             IMGALLOCALIGN) < 0){
+    free(scaled);
     return NULL;
   }
 //fprintf(stderr, "INFRAME DAA: %p SDATA: %p FDATA: %p to %d/%d\n", inframe->data[0], sframe->data[0], ncv->details->frame->data[0], sframe->height, sframe->width);
@@ -615,7 +627,7 @@ ffmpeg_resize_internal(const ncvisual* ncv, int rows, int* stride, int cols,
                          inframe->linesize, 0, srcleny, dptrs, dlinesizes);
   if(height < 0){
 //fprintf(stderr, "Error applying scaling (%d X %d)\n", inframe->height, inframe->width);
-    av_freep(&dptrs[0]);
+    free(scaled);
     return NULL;
   }
 //fprintf(stderr, "scaled %d/%d to %d/%d\n", ncv->pixy, ncv->pixx, rows, cols);
@@ -664,7 +676,7 @@ ffmpeg_blit(const ncvisual* ncv, unsigned rows, unsigned cols, ncplane* n,
     ret = -1;
   }
   if(data != ncv->data){
-    av_freep(&data); // &dptrs[0]
+    free(data);
   }
   return ret;
 }

@@ -2,6 +2,27 @@
 #include "internal.h"
 #include "windows.h"
 #ifdef __MINGW32__
+int restore_windows_console_input(tinfo* ti){
+  if(!ti->input_mode_preserved_valid){
+    return 0;
+  }
+  if(!SetConsoleMode(ti->inhandle, ti->input_mode_preserved)){
+    logerror("couldn't restore input console mode");
+    return -1;
+  }
+  return 0;
+}
+
+int restore_windows_console(tinfo* ti){
+  int ret = restore_windows_console_input(ti);
+  if(ti->output_mode_preserved_valid &&
+     !SetConsoleMode(ti->outhandle, ti->output_mode_preserved)){
+    logerror("couldn't restore output console mode");
+    ret = -1;
+  }
+  return ret;
+}
+
 // ti has been memset to all zeroes. windows configuration is static.
 int prepare_windows_terminal(tinfo* ti, size_t* tablelen, size_t* tableused){
   const struct wtermdesc {
@@ -46,13 +67,23 @@ int prepare_windows_terminal(tinfo* ti, size_t* tablelen, size_t* tableused){
   ti->caps.colors = 256;
   ti->inhandle = GetStdHandle(STD_INPUT_HANDLE);
   ti->outhandle = GetStdHandle(STD_OUTPUT_HANDLE);
-  if(ti->inhandle == INVALID_HANDLE_VALUE){
-    logerror("couldn't get input handle");
-    return -1;
-  }
-  if(ti->outhandle == INVALID_HANDLE_VALUE){
-    logerror("couldn't get output handle");
-    return -1;
+  DWORD inmode;
+  DWORD outmode;
+  const bool console_input = ti->inhandle &&
+                             ti->inhandle != INVALID_HANDLE_VALUE &&
+                             GetConsoleMode(ti->inhandle, &inmode);
+  const bool console_output = ti->outhandle &&
+                              ti->outhandle != INVALID_HANDLE_VALUE &&
+                              GetConsoleMode(ti->outhandle, &outmode);
+  if(!console_input || !console_output){
+    // A test harness or redirected child can have pipe/file standard handles
+    // rather than a ConPTY. Keep the static Windows escape table, but skip
+    // console interrogation and input-mode changes. ttyfd gates the later
+    // cbreak/query paths and default geometry supplies the off-screen size.
+    ti->ttyfd = -1;
+    ti->qterm = TERMINAL_MSTERMINAL;
+    loginfo("using redirected Windows terminal mode");
+    return 0;
   }
   if(!SetConsoleOutputCP(CP_UTF8)){
     logerror("couldn't set output page to utf8");
@@ -62,17 +93,22 @@ int prepare_windows_terminal(tinfo* ti, size_t* tablelen, size_t* tableused){
     logerror("couldn't set input page to utf8");
     return -1;
   }
-  DWORD inmode;
-  if(!GetConsoleMode(ti->inhandle, &inmode)){
-    logerror("couldn't get input console mode");
-    return -1;
-  }
-  // we don't explicitly disable ENABLE_ECHO_INPUT and ENABLE_LINE_INPUT
-  // yet; those are handled in cbreak_mode(). just get ENABLE_INSERT_MODE.
-  inmode &= ~ENABLE_INSERT_MODE;
-  inmode |= ENABLE_MOUSE_INPUT | ENABLE_PROCESSED_INPUT
-            | ENABLE_QUICK_EDIT_MODE | ENABLE_EXTENDED_FLAGS
-            | ENABLE_WINDOW_INPUT | ENABLE_VIRTUAL_TERMINAL_INPUT;
+  ti->input_mode_preserved = inmode;
+  ti->input_mode_preserved_valid = true;
+  ti->output_mode_preserved = outmode;
+  ti->output_mode_preserved_valid = true;
+  // This input layer consumes a VT byte stream through read(), not Win32
+  // INPUT_RECORD structures.  Mixing ENABLE_VIRTUAL_TERMINAL_INPUT with
+  // ENABLE_MOUSE_INPUT / ENABLE_WINDOW_INPUT can signal the console handle
+  // for a record that read() cannot consume, leaving the input thread stuck
+  // inside read() and making notcurses_stop() hang forever at pthread_join().
+  // Mouse events are requested below using DECSET and arrive as SGR VT bytes.
+  // Quick Edit must also stay disabled so selecting cannot suspend input.
+  // ECHO_INPUT and LINE_INPUT are cleared later by cbreak_mode().
+  inmode &= ~(ENABLE_INSERT_MODE | ENABLE_MOUSE_INPUT |
+              ENABLE_WINDOW_INPUT | ENABLE_QUICK_EDIT_MODE);
+  inmode |= ENABLE_PROCESSED_INPUT | ENABLE_EXTENDED_FLAGS |
+            ENABLE_VIRTUAL_TERMINAL_INPUT;
   if(!SetConsoleMode(ti->inhandle, inmode)){
     logerror("couldn't set input console mode");
     return -1;
@@ -80,12 +116,14 @@ int prepare_windows_terminal(tinfo* ti, size_t* tablelen, size_t* tableused){
   // if we're a true Windows Terminal, SetConsoleMode() ought succeed.
   // otherwise, we're something else; go ahead and try.
   // FIXME handle redirection to a file, where this fails
-  if(!SetConsoleMode(ti->outhandle, ENABLE_PROCESSED_OUTPUT
-                     | ENABLE_WRAP_AT_EOL_OUTPUT
-                     | ENABLE_VIRTUAL_TERMINAL_PROCESSING
-                     | DISABLE_NEWLINE_AUTO_RETURN
-                     | ENABLE_LVB_GRID_WORLDWIDE)){
+  outmode |= ENABLE_PROCESSED_OUTPUT
+             | ENABLE_WRAP_AT_EOL_OUTPUT
+             | ENABLE_VIRTUAL_TERMINAL_PROCESSING
+             | DISABLE_NEWLINE_AUTO_RETURN
+             | ENABLE_LVB_GRID_WORLDWIDE;
+  if(!SetConsoleMode(ti->outhandle, outmode)){
     logerror("couldn't set output console mode");
+    (void)restore_windows_console(ti);
     return -1;
   }
   loginfo("verified Windows ConPTY");

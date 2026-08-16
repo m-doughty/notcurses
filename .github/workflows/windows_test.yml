@@ -30,6 +30,7 @@ jobs:
             git
             mingw-w64-ucrt-x86_64-cmake
             mingw-w64-ucrt-x86_64-doctest
+            mingw-w64-ucrt-x86_64-ffmpeg
             mingw-w64-ucrt-x86_64-libdeflate
             mingw-w64-ucrt-x86_64-libunistring
             mingw-w64-ucrt-x86_64-ncurses
@@ -49,16 +50,34 @@ jobs:
           cd /ucrt64/lib && \
             ln -s "${HOME}/repos/QR-Code-generator/c/libqrcodegen.a" ./libqrcodegen.a
 
+      # USE_MULTIMEDIA=ffmpeg to match the ubuntu and macos lanes, which take
+      # ffmpeg from apt and brew respectively. Without it src/media/ffmpeg.c is
+      # wrapped entirely in `#ifdef USE_FFMPEG` and compiles to nothing, so this
+      # lane silently gave zero coverage to the multimedia backend on Windows.
+      # MSYS2's ffmpeg package is fine here: this workflow builds and tests on
+      # an ephemeral runner and publishes no artefacts, so no distribution --
+      # and therefore no GPL/LGPL redistribution obligation -- arises. The
+      # binaries that ARE distributed come from Notcurses::Native's release
+      # lanes, which deliberately source-build a decoder-only LGPL-2.1 ffmpeg
+      # instead, and ship THIRD-PARTY.md plus the matching licence texts.
       - name: config
         run: |
           mkdir build && cd build
           cmake .. \
             -GNinja \
             -DCMAKE_BUILD_TYPE=Release \
-            -DUSE_MULTIMEDIA=none \
+            -DUSE_MULTIMEDIA=ffmpeg \
             -DUSE_PANDOC=off \
             -DUSE_QRCODEGEN=on \
             -DUSE_STATIC=off
+          # Guard against cmake silently falling back when the ffmpeg probe
+          # fails: a downgraded build would pass this job while giving the
+          # multimedia backend no compile coverage at all.
+          if ! grep -q 'USE_MULTIMEDIA:STRING=ffmpeg' CMakeCache.txt; then
+            echo "::error::USE_MULTIMEDIA did not land as 'ffmpeg' in CMakeCache"
+            grep -E '(USE_MULTIMEDIA|FFMPEG|AVCODEC)' CMakeCache.txt || true
+            exit 1
+          fi
 
       - name: build
         run: |

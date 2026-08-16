@@ -17,6 +17,7 @@
 #include "compat/compat.h"
 #include "unixsig.h"
 #include "banner.h"
+#include "windows.h"
 
 #define ESC "\x1b"
 #define TABSTOP 8
@@ -143,9 +144,13 @@ notcurses_stop_minimal(void* vnc, void** altstack, int errret){
   }
   if(nc->tcache.ttyfd >= 0){
     ret |= notcurses_mice_disable(nc);
+#ifndef __MINGW32__
     if(nc->tcache.tpreserved){
       ret |= tcsetattr(nc->tcache.ttyfd, TCSAFLUSH, nc->tcache.tpreserved);
     }
+#else
+    ret |= restore_windows_console_input(&nc->tcache);
+#endif
     // don't use leave_alternate_screen() here; we need pop the keyboard
     // whether we're in regular or alternate screen, and we need it done
     // before returning to the regular screen if we're in the alternate. if
@@ -170,6 +175,10 @@ notcurses_stop_minimal(void* vnc, void** altstack, int errret){
       }
     }
   }
+#ifdef __MINGW32__
+  // Keep VT output enabled until all restoration sequences have been sent.
+  ret |= restore_windows_console(&nc->tcache);
+#endif
   if(errret){
     ret = errret;
   }

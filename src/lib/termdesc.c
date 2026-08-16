@@ -1373,13 +1373,19 @@ int interrogate_terminfo(tinfo* ti, FILE* out, unsigned utf8,
       free(ti->tpreserved);
       return -1;
     }
-    // enter cbreak mode regardless of user preference until we've performed
-    // terminal interrogation. at that point, we might restore original mode.
+#endif
+    // Enter cbreak mode regardless of user preference until we've performed
+    // terminal interrogation. At that point, we might restore original mode.
+    // Windows must do this before sending queries, or ConPTY replies are
+    // echoed visibly while ENABLE_ECHO_INPUT / ENABLE_LINE_INPUT remain set.
     if(cbreak_mode(ti)){
+#ifdef __MINGW32__
+      (void)restore_windows_console(ti);
+#else
       free(ti->tpreserved);
+#endif
       return -1;
     }
-#endif
     // if we already know our terminal (e.g. on the linux console), there's no
     // need to send the identification queries. the controls are sufficient.
     bool minimal = (ti->qterm != TERMINAL_UNKNOWN);
@@ -1499,7 +1505,11 @@ int interrogate_terminfo(tinfo* ti, FILE* out, unsigned utf8,
     }
     if(nocbreak){
       // FIXME do this in input later, upon signaling completion?
+#ifdef __MINGW32__
+      if(restore_windows_console_input(ti)){
+#else
       if(tcsetattr(ti->ttyfd, TCSANOW, ti->tpreserved)){
+#endif
         goto err;
       }
     }
@@ -1545,11 +1555,15 @@ err:
     }
     tty_emit(RMCUP, ti->ttyfd);
   }
+#ifdef __MINGW32__
+  (void)restore_windows_console(ti);
+#else
   if(ti->tpreserved){
     (void)tcsetattr(ti->ttyfd, TCSANOW, ti->tpreserved);
     free(ti->tpreserved);
     ti->tpreserved = NULL;
   }
+#endif
   stop_inputlayer(ti);
   free(ti->esctable);
   free(ti->termversion);

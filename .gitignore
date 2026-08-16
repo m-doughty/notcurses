@@ -22,3 +22,6 @@ rust/Cargo.lock
 *.swo
 *.xz
 .DS_Store
+
+# local scratch for Windows/ConPTY debugging; not part of the build
+.diagnostics/

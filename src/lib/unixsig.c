@@ -22,6 +22,9 @@ int drop_signals(void* nc, void** altstack){
   if(!altstack){
     return 0;
   }
+  // Windows does not install an alternate signal stack, but callers still
+  // free the returned value as part of their common cleanup path.
+  *altstack = NULL;
   if(!atomic_compare_exchange_strong(&signal_nc, &expected, NULL)){
     return -1;
   }
