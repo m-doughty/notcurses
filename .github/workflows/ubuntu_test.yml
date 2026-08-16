@@ -6,6 +6,10 @@ on:
   push:
     branches:
       - master
+      # Fork-local: the Windows-compatibility work lives on this branch, and
+      # without it here a push matches no trigger at all. Drop this line once
+      # the branch merges to master.
+      - with-tmux-fix
 
 jobs:
   tests:
