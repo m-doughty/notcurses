@@ -424,6 +424,10 @@ void sigwinch_handler(int signo);
 
 void init_lang(void);
 
+// Windows-only CRT UTF-8 mode; a no-op elsewhere. Must run even when the
+// caller passed NCOPTION_INHIBIT_SETLOCALE -- see the definition's comment.
+void init_windows_utf8_crt(void);
+
 int reset_term_attributes(const tinfo* ti, fbuf* f);
 int reset_term_palette(const tinfo* ti, fbuf* f, unsigned touchedpalette);
 
@@ -1079,8 +1083,9 @@ int ncvisual_blit_internal(const struct ncvisual* ncv, int rows, int cols,
                            ncplane* n, const struct blitset* bset,
                            const blitterargs* bargs);
 
-// if fd < 0, blocking_write() is going to emit an EBADF, so we don't
-// bother checking it here explicitly.
+// fd < 0 is rejected by blocking_write() itself, which returns an error
+// rather than writing. It used to rely on write(2) answering EBADF, but that
+// is a POSIX-only guarantee -- see the comment there.
 static inline int
 tty_emit(const char* seq, int fd){
   if(!seq){

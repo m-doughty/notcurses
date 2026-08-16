@@ -1103,12 +1103,25 @@ int ncplane_family_destroy(ncplane *ncp){
 // of "C" or "POSIX"). recommended practice is for the client code to have
 // called setlocale() themselves, and set the NCOPTION_INHIBIT_SETLOCALE flag.
 // if that flag is set, we take the locale and encoding as we get them.
-void init_lang(void){
+// Put the Windows C runtime into UTF-8 mode. This is NOT the LANG-derived
+// locale that NCOPTION_INHIBIT_SETLOCALE exists to leave alone -- it is a CRT
+// decoding mode, and without it the UCRT stays in the single-byte "C" locale
+// where mbrtowc(), and therefore utf8_egc_len(), consumes one byte at a time.
+// A multi-byte EGC then gets split across consecutive cells. compat.h hardcodes
+// nl_langinfo(CODESET) to "UTF-8" on this platform, so caps.utf8 is true either
+// way: skipping this leaves the library emitting UTF-8 it cannot itself decode.
+// Hence it runs regardless of the inhibit flag, unlike everything in
+// init_lang() below.
+void init_windows_utf8_crt(void){
 #ifdef __MINGW32__
   if(setlocale(LC_ALL, ".UTF8") == NULL){
     logwarn("couldn't set LC_ALL to utf8");
   }
 #endif
+}
+
+void init_lang(void){
+  init_windows_utf8_crt();
   const char* encoding = nl_langinfo(CODESET);
   if(encoding && encoding_is_utf8(encoding)){
     return; // already utf-8, great!
@@ -1207,6 +1220,7 @@ notcurses_early_init(const struct notcurses_options* opts, FILE* fp, unsigned* u
     ret->loglevel = opts->loglevel;
   }
   set_loglevel_from_env(&ret->loglevel);
+  init_windows_utf8_crt();
   if(!(ret->flags & NCOPTION_INHIBIT_SETLOCALE)){
     init_lang();
   }
@@ -1469,7 +1483,11 @@ int notcurses_stop(notcurses* nc){
 //fprintf(stderr, "CLOSING TO %d/%d\n", nc->rstate.logendy, nc->rstate.logendx);
       goto_location(nc, &nc->rstate.f, nc->rstate.logendy, nc->rstate.logendx, NULL);
 //fprintf(stderr, "***"); fflush(stderr);
-      fbuf_finalize(&nc->rstate.f, stdout);
+      // nc->ttyfp, not stdout: notcurses_init() stored the caller's FILE* and
+      // every other flush (fbuf_flush at 142/1360/1396) honours it. Writing
+      // the final cursor-repositioning sequence to stdout regardless defeats
+      // a caller that isolated us onto a null device on purpose.
+      fbuf_finalize(&nc->rstate.f, nc->ttyfp);
     }
     if(nc->stdplane){
       notcurses_drop_planes(nc);

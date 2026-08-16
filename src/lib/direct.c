@@ -839,7 +839,12 @@ ncdirect_stop_minimal(void* vnc, void** altstack, int errret){
   fbuf f = {0};
   if(fbuf_init_small(&f) == 0){
     ret |= reset_term_attributes(&nc->tcache, &f);
-    ret |= fbuf_finalize(&f, stdout);
+    // nc->ttyfp, not stdout: every other write in this file goes through the
+    // FILE* the caller supplied to ncdirect_init(), and teardown must too. A
+    // caller that deliberately isolated us onto /dev/null or NUL otherwise
+    // still gets an SGR reset on its real stdout at stop time -- which lands
+    // in the middle of a TAP stream when the caller is a test harness.
+    ret |= fbuf_finalize(&f, nc->ttyfp);
   }
   if(nc->tcache.ttyfd >= 0){
     if(!(nc->flags & NCDIRECT_OPTION_DRAIN_INPUT)){
@@ -900,6 +905,7 @@ ncdirect* ncdirect_core_init(const char* termtype, FILE* outfp, uint64_t flags){
   }
   ret->flags = flags;
   ret->ttyfp = outfp;
+  init_windows_utf8_crt();
   if(!(flags & NCDIRECT_OPTION_INHIBIT_SETLOCALE)){
     init_lang();
   }

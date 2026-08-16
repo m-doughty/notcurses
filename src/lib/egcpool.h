@@ -116,6 +116,15 @@ utf8_egc_len(const char* gcluster, int* colcount){
       logerror("invalid UTF8: %s", gcluster);
       return -1;
     }
+    // A NUL terminator contributes neither bytes nor columns. The loop's
+    // `while(r)` already stops here, but only after the width logic below has
+    // run on wc == 0. That is harmless where wcwidth(0) is 0, as POSIX
+    // requires -- but Windows answers it negatively while iswcntrl(0) is
+    // false, so the fallback assigned it a width of 1 and ncstrwidth("")
+    // reported one column instead of none.
+    if(r == 0){
+      break;
+    }
     if(prevw && !injoin && uc_is_grapheme_break(prevw, wc)){
       break; // starts a new EGC, exit and do not claim
     }

@@ -270,6 +270,17 @@ fbuf_free(fbuf* f){
 static inline int
 blocking_write(int fd, const char* buf, size_t buflen){
 //fprintf(stderr, "writing %zu to %d...\n", buflen, fd);
+  // POSIX write(2) answers an invalid descriptor with EBADF, which the loop
+  // below reports as an ordinary error. The Windows UCRT does not: _write()
+  // routes an invalid descriptor through the invalid-parameter handler, which
+  // calls __fastfail() and takes the whole process down with
+  // STATUS_STACK_BUFFER_OVERRUN (0xC0000409) -- no errno, no return. A ttyfd
+  // of -1 is entirely normal (any redirected or non-console output, and every
+  // headless test), so this has to be a plain error return on both platforms.
+  if(fd < 0){
+    logerror("Invalid descriptor %d", fd);
+    return -1;
+  }
   size_t written = 0;
   while(written < buflen){
     ssize_t w = write(fd, buf + written, buflen - written);

@@ -3030,10 +3030,15 @@ linesigs_disable(tinfo* ti){
   if(!ti->ictx->linesigs){
     logwarn("linedisc signals already disabled");
   }
-#ifndef __MINGW32__
+  // No controlling terminal means there is no line discipline to change, on
+  // any platform: succeed as a no-op rather than failing. This guard used to
+  // sit inside the POSIX branch only, so on Windows a redirected/headless
+  // context (where prepare_windows_terminal() sets ttyfd to -1) instead fell
+  // through to GetConsoleMode() on a non-console handle and returned -1.
   if(ti->ttyfd < 0){
     return 0;
   }
+#ifndef __MINGW32__
   struct termios tios;
   if(tcgetattr(ti->ttyfd, &tios)){
     logerror("Couldn't preserve terminal state for %d (%s)", ti->ttyfd, strerror(errno));
@@ -3070,10 +3075,11 @@ linesigs_enable(tinfo* ti){
   if(ti->ictx->linesigs){
     logwarn("linedisc signals already enabled");
   }
-#ifndef __MINGW32__
+  // See linesigs_disable(): no controlling terminal, nothing to enable.
   if(ti->ttyfd < 0){
     return 0;
   }
+#ifndef __MINGW32__
   struct termios tios;
   if(tcgetattr(ti->ttyfd, &tios)){
     logerror("couldn't preserve terminal state for %d (%s)", ti->ttyfd, strerror(errno));
