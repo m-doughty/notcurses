@@ -88,6 +88,15 @@ char* notcurses_data_dir(void);
 // pthread_cond_clockwait(), which is highly nonportable.
 int pthread_condmonotonic_init(pthread_cond_t* cond);
 
+// writes the current time into |ts| on whatever clock a condvar created by
+// pthread_condmonotonic_init() measures absolute deadlines against
+// (CLOCK_MONOTONIC where pthread_condattr_setclock() is available, otherwise
+// the default CLOCK_REALTIME -- macOS and windows). always compute
+// pthread_cond_timedwait() deadlines for such a condvar starting from this,
+// never from a hardcoded clockid: mixing the clocks makes the wait either
+// time out instantly or effectively never. returns 0 on success.
+int pthread_condmonotonic_gettime(struct timespec* ts);
+
 int set_fd_nonblocking(int fd, unsigned state, unsigned* oldstate);
 int set_fd_cloexec(int fd, unsigned state, unsigned* oldstate);
 

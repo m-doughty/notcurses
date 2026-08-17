@@ -192,3 +192,20 @@ int pthread_condmonotonic_init(pthread_cond_t* cond){
   pthread_condattr_destroy(&cat);
   return 0;
 }
+
+// answers with the current time on the clock a condvar initialized by
+// pthread_condmonotonic_init() actually measures absolute deadlines against.
+// pthread_condattr_setclock(CLOCK_MONOTONIC) is unavailable on macOS and
+// windows (see above), so condvars there remain on the default
+// CLOCK_REALTIME. deadline arithmetic for pthread_cond_timedwait() MUST
+// start from this clock: a CLOCK_MONOTONIC deadline handed to a
+// CLOCK_REALTIME condvar lies decades in the past (macOS counts monotonic
+// time from boot), so the wait times out instantly; the reverse mixup waits
+// decades. returns 0 on success, filling in |ts|.
+int pthread_condmonotonic_gettime(struct timespec* ts){
+#if defined(__APPLE__) || defined(__MINGW32__)
+  return clock_gettime(CLOCK_REALTIME, ts);
+#else
+  return clock_gettime(CLOCK_MONOTONIC, ts);
+#endif
+}

@@ -3117,9 +3117,16 @@ struct initial_responses* inputlayer_get_responses(inputctx* ictx){
   struct initial_responses* iresp;
   struct timespec deadline;
   // icond is created with pthread_condmonotonic_init(), so its absolute
-  // deadlines must use the same clock.  A CLOCK_REALTIME deadline would be
-  // interpreted as an effectively decades-long CLOCK_MONOTONIC timeout.
-  bool have_deadline = clock_gettime(CLOCK_MONOTONIC, &deadline) == 0;
+  // deadlines must be computed on the clock that condvar actually uses --
+  // CLOCK_MONOTONIC where pthread_condattr_setclock() exists, but the
+  // default CLOCK_REALTIME on macOS and windows. Hardcoding either clock
+  // here breaks the other family: a CLOCK_MONOTONIC deadline on a
+  // CLOCK_REALTIME condvar lies decades in the past, so the wait times out
+  // instantly and terminal interrogation is abandoned before the terminal's
+  // replies arrive (no pixel support, no cell geometry); the reverse mixup
+  // waits effectively forever. pthread_condmonotonic_gettime() answers on
+  // the matching clock.
+  bool have_deadline = pthread_condmonotonic_gettime(&deadline) == 0;
   if(have_deadline){
     ++deadline.tv_sec;
   }
@@ -3138,7 +3145,7 @@ struct initial_responses* inputlayer_get_responses(inputctx* ictx){
       // Re-arm rather than falling back to an unbounded wait: a single request
       // can be missed if the input thread was mid-read, and an unbounded wait
       // would then hang here forever.
-      if(clock_gettime(CLOCK_MONOTONIC, &deadline)){
+      if(pthread_condmonotonic_gettime(&deadline)){
         have_deadline = false;
       }else{
         ++deadline.tv_sec;
