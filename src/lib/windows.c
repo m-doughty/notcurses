@@ -37,7 +37,12 @@ int prepare_windows_terminal(tinfo* ti, size_t* tablelen, size_t* tableused){
     { ESCAPE_SC,    "\x1b[s", },
     { ESCAPE_RC,    "\x1b[u", },
     { ESCAPE_INITC, "\x1b]4;%p1%d;rgb:%p2%{255}%*%{1000}%/%2.2X/%p3%{255}%*%{1000}%/%2.2X/%p4%{255}%*%{1000}%/%2.2X\E\\", },
-    { ESCAPE_CLEAR, "\x1b[2J", },
+    // ConPTY's ED(2) erases without homing the cursor, but clear_and_home()
+    // asserts rstate.x = rstate.y = 0 after emitting this escape — and the
+    // next frame's first cursor move is elided on the strength of that
+    // assertion, so row 0 lands wherever the cursor actually was. Match the
+    // xterm family's terminfo clear (\E[H\E[2J) so the assertion holds.
+    { ESCAPE_CLEAR, "\x1b[H\x1b[2J", },
     { ESCAPE_SMCUP, "\x1b[?1049h", },
     { ESCAPE_RMCUP, "\x1b[?1049l", },
     { ESCAPE_SETAF, "\x1b[38;5;%i%p1%dm", },
