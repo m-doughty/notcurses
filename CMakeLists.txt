@@ -105,6 +105,16 @@ find_package(PkgConfig REQUIRED)
 # some distros (<cough>motherfucking alpine</cough> subsume terminfo directly
 # into ncurses. accept either, and may god have mercy on our souls.
 pkg_search_module(TERMINFO REQUIRED tinfo>=6.1 ncursesw>=6.1)
+if(WIN32)
+  # (fork) MSYS2's ncursesw.pc lists ncurses' own dependencies (-lsystre
+  # -ltre -lintl -liconv -lpcre2-posix) in its public Libs:. The ncurses DLL
+  # imports those itself; nothing here needs them, and -lintl is harmful:
+  # gettext >= 1.0's libintl-8.dll exports unprefixed gnulib names
+  # (uc_width, uc_tolower, ...) that would bind ahead of ${unistring} and
+  # make libnotcurses-core import libintl. TERMINFO_STATIC_LIBRARIES keeps
+  # the full list, which a static ncurses really does need.
+  list(FILTER TERMINFO_LIBRARIES INCLUDE REGEX "^(ncursesw|tinfow?)$")
+endif()
 set_property(GLOBAL APPEND PROPERTY PACKAGES_FOUND terminfo)
 set_package_properties(terminfo PROPERTIES TYPE REQUIRED)
 set(PKGCONF_REQ_PRIV "${TERMINFO_LIBRARIES}")
@@ -278,9 +288,9 @@ target_include_directories(notcurses-core-static
 )
 target_link_libraries(notcurses-core
   PRIVATE
+    "${unistring}" # (fork) ahead of TERMINFO: see the WIN32 filter above
     "${TERMINFO_LIBRARIES}"
     "${LIBM}"
-    "${unistring}"
     "${gpm}"
     "${DEFLATE_LIBRARIES}"
     "${ZLIB_LIBRARIES}"
@@ -290,9 +300,9 @@ target_link_libraries(notcurses-core
 )
 target_link_libraries(notcurses-core-static
   PRIVATE
+    "${unistring}" # (fork) ahead of TERMINFO: see the WIN32 filter above
     "${TERMINFO_STATIC_LIBRARIES}"
     "${LIBM}"
-    "${unistring}"
     "${gpm}"
     "${DEFLATE_STATIC_LIBRARIES}"
     "${ZLIB_STATIC_LIBRARIES}"
@@ -463,9 +473,9 @@ target_link_libraries(notcurses-ffi
   PRIVATE
     "${DEFLATE_LIBRARIES}"
     "${ZLIB_LIBRARIES}"
+    "${unistring}" # (fork) ahead of TERMINFO: see the WIN32 filter above
     "${TERMINFO_LIBRARIES}"
     "${LIBM}"
-    "${unistring}"
     "${gpm}"
     "notcurses-core"
   PUBLIC
