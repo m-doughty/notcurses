@@ -1,6 +1,7 @@
 #include "main.h"
 #include <algorithm>
 #include <chrono>
+#include <initializer_list>
 #include <string>
 #include <thread>
 #include <vector>
@@ -88,22 +89,70 @@ public:
     return true;
   }
 
+  // (fork) Waits, up to about |ms| milliseconds, until the input layer has
+  // read() everything fed so far: nothing is left unread in the pipe. A piece
+  // fed only then arrives in a read of its own, with no timer in between: a
+  // sleep is only a lower bound, and under load or timer coalescing (macOS
+  // CI, where a 20ms sleep was seen to take 60-120ms) can by itself outlast
+  // NCINPUT_ESCAPE_HOLD_MS. False if the pipe never drained, or can't be
+  // asked.
+  //
+  // Windows can't be asked. The input thread idles in a synchronous
+  // ReadFile() on this pipe (stop_inputlayer() in in.c), and Windows
+  // serializes synchronous I/O on a file object: PeekNamedPipe() would wait
+  // for that read, and the read for our next write -- a deadlock. There a
+  // write goes straight into the pending read, so the reader is only given
+  // a moment, spun rather than slept (a sleep is a 15.6ms tick there). No
+  // proof rests on it there: the pieces these tests hold back are CSI
+  // prefixes, which the win32-input-mode transcoder keeps, with no deadline,
+  // until more bytes come (w32im_transcode()), so one read late is absorbed
+  // all the same.
+  bool drained(int ms){
+#ifdef __MINGW32__
+    const auto settled = std::chrono::steady_clock::now()
+                         + std::chrono::milliseconds(ms < 5 ? ms : 5);
+    while(std::chrono::steady_clock::now() < settled){
+      std::this_thread::yield();
+    }
+    return true;
+#else
+    const auto deadline = std::chrono::steady_clock::now()
+                          + std::chrono::milliseconds(ms);
+    for(;;){
+      int unread = 0;
+      if(ioctl(fds_[0], FIONREAD, &unread) < 0){
+        return false;
+      }
+      if(unread == 0){
+        return true;
+      }
+      if(std::chrono::steady_clock::now() >= deadline){
+        return false;
+      }
+      std::this_thread::yield(); // no timer: see above
+    }
+#endif
+  }
+
   // the next input id within about |ms| milliseconds, or 0
   uint32_t next(int ms){
     ncinput ni;
     return next(ms, &ni);
   }
 
-  // the same, with the whole event in *ni
+  // the same, with the whole event in *ni. (fork) Waits on notcurses_get()'s
+  // deadline rather than polling between sleeps, so an event is taken the
+  // moment it is delivered: a test timing a delivery measures notcurses, not
+  // its own polling (a 1ms sleep was seen to take ~26ms at background QoS on
+  // macOS), and the wait for nothing is bounded by |ms| however long sleeps
+  // take.
   uint32_t next(int ms, ncinput* ni){
-    for(int i = 0 ; i < ms ; ++i){
-      const uint32_t id = notcurses_get_nblock(nc_, ni);
-      if(id != 0){
-        return id;
-      }
-      std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-    return 0;
+    struct timespec deadline;
+    // the clock notcurses' input condvar measures deadlines against
+    REQUIRE(0 == pthread_condmonotonic_gettime(&deadline));
+    ns_to_timespec(timespec_to_ns(&deadline)
+                   + static_cast<uint64_t>(ms) * UINT64_C(1000000), &deadline);
+    return notcurses_get(nc_, &deadline, ni);
   }
 
   // stop the instance now rather than on destruction: notcurses_stop()'s
@@ -124,6 +173,42 @@ private:
 };
 
 } // namespace
+
+// (fork) Was |start| less than NCINPUT_ESCAPE_HOLD_MS ago? The timing proofs
+// below all rest on this one fact: a hold lasts that long from when its first
+// byte was read, which is after |start| (taken before the write), so whatever
+// had happened by now happened before any hold begun since |start| could run
+// out. Ask only after observing, so that the observation is covered too.
+// steady_clock and the library's CLOCK_MONOTONIC advance together.
+static auto inside_hold(std::chrono::steady_clock::time_point start) -> bool {
+  return std::chrono::steady_clock::now() - start
+         < std::chrono::milliseconds(NCINPUT_ESCAPE_HOLD_MS);
+}
+
+// (fork) Attempts at a test whose proof needs its events inside the hold
+// (inside_hold()). The scheduler can stretch any span -- past the hold, with
+// a starved CPU at background QoS -- and an attempt it stretched proves
+// nothing either way, so it is run again on a fresh instance; the test fails
+// only if no attempt ever fits.
+constexpr int HOLD_WINDOW_ATTEMPTS = 10;
+
+// (fork) Feeds |pieces| so that each reaches the input layer in a read of its
+// own, the next sent as soon as the last has been read (drained()). True if
+// they are known to have arrived within NCINPUT_ESCAPE_HOLD_MS: the span from
+// the first write to the last piece having been read bounds the input
+// layer's own, since its hold starts once the first piece has been read, and
+// a replay is only ever decided once the hold is up. False if the scheduler
+// stretched it past that, in which case a replay is correct too, and the
+// attempt proves nothing.
+static auto feed_fragmented(PipedNotcurses& p,
+                            std::initializer_list<const char*> pieces) -> bool {
+  const auto start = std::chrono::steady_clock::now();
+  for(const char* piece : pieces){
+    REQUIRE(p.feed(piece));
+    REQUIRE(p.drained(3000));
+  }
+  return inside_hold(start);
+}
 
 TEST_CASE("Input") {
   auto nc_ = testing_notcurses();
@@ -205,21 +290,33 @@ TEST_CASE("LargePasteIsNotDropped") {
 
 TEST_CASE("RuntimeCellGeometryReports") {
   if(is_test_tty()){ return; } // the pipe is bulk text with a POSIX /dev/tty
-  PipedNotcurses p;
-  REQUIRE(p.nc());
-  auto check_report = [&](const std::string& bytes) {
-    REQUIRE(p.feed(bytes + "Z"));
-    CHECK(p.next(3000) == 'Z'); // no report bytes leaked as keypresses
-  };
-  check_report("\x1b[6;32;14t");
-  check_report("\x1b[6;40;18t");
-  check_report("\x1b[6;40;18t");
-  check_report("\x1b[6;0;14t");
-  check_report("\x1b[6;4294967328;14t");
-  REQUIRE(p.feed("\x1b[6;2"));
-  std::this_thread::sleep_for(std::chrono::milliseconds(20));
-  check_report("4;10t");
-  CHECK(p.next(20) == 0);
+  {
+    PipedNotcurses p;
+    REQUIRE(p.nc());
+    auto check_report = [&](const std::string& bytes) {
+      REQUIRE(p.feed(bytes + "Z"));
+      CHECK(p.next(3000) == 'Z'); // no report bytes leaked as keypresses
+    };
+    check_report("\x1b[6;32;14t");
+    check_report("\x1b[6;40;18t");
+    check_report("\x1b[6;40;18t");
+    check_report("\x1b[6;0;14t");
+    check_report("\x1b[6;4294967328;14t");
+    CHECK(p.next(20) == 0);
+  }
+  // (fork) and one in two reads, on an instance of its own: an attempt the
+  // scheduler stretched past the hold is run again (feed_fragmented())
+  for(int attempt = 0 ; attempt < HOLD_WINDOW_ATTEMPTS ; ++attempt){
+    PipedNotcurses p;
+    REQUIRE(p.nc());
+    if(feed_fragmented(p, { "\x1b[6;2", "4;10t" })){
+      REQUIRE(p.feed("Z"));
+      CHECK(p.next(3000) == 'Z');
+      CHECK(p.next(20) == 0);
+      return;
+    }
+  }
+  FAIL("no attempt delivered both pieces within NCINPUT_ESCAPE_HOLD_MS");
 }
 
 // (fork) Whether an unfinished escape waits for the rest of its bytes. Two
@@ -247,24 +344,31 @@ TEST_CASE("PartialEscapeHoldPolicy") {
   CHECK(0 == noclock);
 }
 
-// (fork) A report split over three reads is still absorbed whole.
+// (fork) A report split over three reads is still absorbed whole, if the
+// pieces arrive within NCINPUT_ESCAPE_HOLD_MS. An attempt the scheduler
+// stretched past that is run again (feed_fragmented()).
 TEST_CASE("ReportFragmentedAcrossReads") {
-  PipedNotcurses p;
-  REQUIRE(p.nc());
-  for(const char* piece : { "\x1b[6", ";24", ";10t" }){
-    REQUIRE(p.feed(piece));
-    std::this_thread::sleep_for(std::chrono::milliseconds(20));
-  }
-  REQUIRE(p.feed("Z"));
-  if(is_test_tty()){
-    // bulk path: the pipe is text, so all of it arrives as keys, in order
-    for(const char c : std::string("\x1b[6;24;10tZ")){
-      CHECK(p.next(3000) == static_cast<uint32_t>(c));
+  for(int attempt = 0 ; attempt < HOLD_WINDOW_ATTEMPTS ; ++attempt){
+    PipedNotcurses p;
+    REQUIRE(p.nc());
+    const bool inside = feed_fragmented(p, { "\x1b[6", ";24", ";10t" });
+    REQUIRE(p.feed("Z"));
+    if(is_test_tty()){
+      // bulk path: the pipe is text, so all of it arrives as keys, in order,
+      // however long it took
+      for(const char c : std::string("\x1b[6;24;10tZ")){
+        CHECK(p.next(3000) == static_cast<uint32_t>(c));
+      }
+      CHECK(p.next(20) == 0);
+      return;
     }
-  }else{
-    CHECK(p.next(3000) == 'Z');
+    if(inside){
+      CHECK(p.next(3000) == 'Z');
+      CHECK(p.next(20) == 0);
+      return;
+    }
   }
-  CHECK(p.next(20) == 0);
+  FAIL("no attempt delivered the pieces within NCINPUT_ESCAPE_HOLD_MS");
 }
 
 // (fork) A piece whose remainder never comes is held for
@@ -288,56 +392,88 @@ TEST_CASE("UnfinishedEscapeIsReplayedAfterHold") {
 
 // (fork) A key typed while a piece is held does not wait for the hold to
 // expire: it cannot continue the sequence, so the piece and the key are
-// delivered together, in the order they came.
+// delivered together, in the order they came. Those are the keys a hold that
+// ran out would give too, so it is when they come that tells the two apart:
+// a replay seen while the piece's hold could not yet have run out
+// (inside_hold()) was ended by the key.
 TEST_CASE("KeyTypedDuringHoldEndsIt") {
-  PipedNotcurses p;
-  REQUIRE(p.nc());
-  REQUIRE(p.feed("\x1b[6;2"));
-  std::this_thread::sleep_for(std::chrono::milliseconds(20));
-  REQUIRE(p.feed("x"));
-  CHECK(p.next(3000) == NCKEY_ESC);
-  for(const char c : std::string("[6;2x")){
-    CHECK(p.next(3000) == static_cast<uint32_t>(c));
+  for(int attempt = 0 ; attempt < HOLD_WINDOW_ATTEMPTS ; ++attempt){
+    PipedNotcurses p;
+    REQUIRE(p.nc());
+    const auto start = std::chrono::steady_clock::now();
+    REQUIRE(p.feed("\x1b[6;2"));
+    REQUIRE(p.drained(3000)); // read: the key comes in a read of its own
+    if(is_test_tty()){
+      // bulk path: no escapes are held; everything arrives as it was sent
+      REQUIRE(p.feed("x"));
+      for(const char c : std::string("\x1b[6;2x")){
+        CHECK(p.next(3000) == static_cast<uint32_t>(c));
+      }
+      CHECK(p.next(20) == 0);
+      return;
+    }
+    if(p.next(0) != 0){
+      // replayed before the key was sent: wrong while its hold still ran, and
+      // otherwise an attempt the scheduler stretched past it
+      CHECK_FALSE(inside_hold(start));
+      continue;
+    }
+    REQUIRE(p.feed("x"));
+    const uint32_t first = p.next(3000);
+    const bool ended = inside_hold(start); // before its hold could run out
+    CHECK(NCKEY_ESC == first);
+    for(const char c : std::string("[6;2x")){
+      CHECK(p.next(3000) == static_cast<uint32_t>(c));
+    }
+    CHECK(p.next(20) == 0);
+    if(ended){
+      return;
+    }
   }
-  CHECK(p.next(20) == 0);
+  FAIL("no attempt saw the replay before NCINPUT_ESCAPE_HOLD_MS was up");
 }
 
 // (fork) After a piece has been replayed as keys, the next escape is walked
 // from its own first byte: Alt+x arrives as one key, at once (not held, as a
 // stale walk of three bytes or more once made it), and so does Up. The
 // automaton's count of bytes walked used to survive the replay, which
-// misparsed both, and failed an assertion in debug builds.
+// misparsed both, and failed an assertion in debug builds. "At once" is a
+// key seen while a hold begun by its own bytes could not yet have run out
+// (inside_hold()).
 TEST_CASE("EscapeAfterReplayIsWalkedAfresh") {
-  PipedNotcurses p;
-  REQUIRE(p.nc());
-  REQUIRE(p.feed("\x1b[1;"));
-  if(is_test_tty()){
-    // bulk path: no escapes are walked; everything arrives as it was sent
-    REQUIRE(p.feed("\x1bx\x1b[A"));
-    for(const char c : std::string("\x1b[1;\x1bx\x1b[A")){
+  for(int attempt = 0 ; attempt < HOLD_WINDOW_ATTEMPTS ; ++attempt){
+    PipedNotcurses p;
+    REQUIRE(p.nc());
+    REQUIRE(p.feed("\x1b[1;"));
+    if(is_test_tty()){
+      // bulk path: no escapes are walked; everything arrives as it was sent
+      REQUIRE(p.feed("\x1bx\x1b[A"));
+      for(const char c : std::string("\x1b[1;\x1bx\x1b[A")){
+        CHECK(p.next(3000) == static_cast<uint32_t>(c));
+      }
+      CHECK(p.next(20) == 0);
+      return;
+    }
+    for(const char c : std::string("\x1b[1;")){ // held, then replayed
       CHECK(p.next(3000) == static_cast<uint32_t>(c));
     }
+    ncinput ni;
+    auto start = std::chrono::steady_clock::now();
+    REQUIRE(p.feed("\x1bx"));
+    CHECK(p.next(3000, &ni) == 'x');
+    bool prompt = inside_hold(start);
+    CHECK(ncinput_alt_p(&ni));
+    CHECK(p.next(20) == 0); // one key, not Escape and then x
+    start = std::chrono::steady_clock::now();
+    REQUIRE(p.feed("\x1b[A"));
+    CHECK(p.next(3000, &ni) == NCKEY_UP);
+    prompt = inside_hold(start) && prompt;
     CHECK(p.next(20) == 0);
-    return;
+    if(prompt){
+      return;
+    }
   }
-  for(const char c : std::string("\x1b[1;")){ // held, then replayed
-    CHECK(p.next(3000) == static_cast<uint32_t>(c));
-  }
-  // not held: well inside NCINPUT_ESCAPE_HOLD_MS, which a stale walk of
-  // three bytes or more would have imposed
-  const auto prompt = std::chrono::milliseconds(NCINPUT_ESCAPE_HOLD_MS / 2);
-  ncinput ni;
-  auto start = std::chrono::steady_clock::now();
-  REQUIRE(p.feed("\x1bx"));
-  CHECK(p.next(3000, &ni) == 'x');
-  CHECK(std::chrono::steady_clock::now() - start < prompt);
-  CHECK(ncinput_alt_p(&ni));
-  CHECK(p.next(20) == 0); // one key, not Escape and then x
-  start = std::chrono::steady_clock::now();
-  REQUIRE(p.feed("\x1b[A"));
-  CHECK(p.next(3000, &ni) == NCKEY_UP);
-  CHECK(std::chrono::steady_clock::now() - start < prompt);
-  CHECK(p.next(20) == 0);
+  FAIL("no attempt saw both keys before NCINPUT_ESCAPE_HOLD_MS was up");
 }
 
 #ifndef __MINGW32__
