@@ -579,6 +579,9 @@ int walk_automaton(automaton* a, struct inputctx* ictx, unsigned candidate,
       memset(ni, 0, sizeof(*ni));
       ni->id = candidate;
       ni->alt = true;
+      // (fork) and in modifiers, which ncinput_alt_p() reads: an Alt-key
+      // arriving as ESC plus the key otherwise looked unmodified
+      ni->modifiers = NCKEY_MOD_ALT;
       return 1;
     }
     loginfo("unexpected transition on %u[%u]",

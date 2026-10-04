@@ -144,6 +144,7 @@ typedef struct sprixel {
   struct sprixel* next;
   struct sprixel* prev;
   unsigned dimy, dimx;  // cell geometry
+  unsigned cellpxy, cellpxx; // geometry owning TAM and auxiliary-vector strides
   int pixy, pixx;       // pixel geometry (might be smaller than cell geo)
   // each tacache entry is one of 0 (standard opaque cell), 1 (cell with
   // some transparency), 2 (annihilated, excised)

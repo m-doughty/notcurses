@@ -273,12 +273,10 @@ is_egc_wordbreak(ncplane* textarea){
   if(egc == NULL){
     return true;
   }
-  wchar_t w;
-  mbstate_t mbstate;
-  memset(&mbstate, 0, sizeof(mbstate));
-  size_t s = mbrtowc(&w, egc, MB_CUR_MAX, &mbstate);
+  uint32_t w;
+  size_t s = nc_mbrtoc32(&w, egc, MB_LEN_MAX);
   free(egc);
-  if(s == (size_t)-1 || s == (size_t)-2){
+  if(s == (size_t)-1){
     return true;
   }
   if(iswordbreak(w)){

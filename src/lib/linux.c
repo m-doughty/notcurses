@@ -5,7 +5,7 @@
 // and store the original alpha value.
 static inline uint8_t*
 fbcon_auxiliary_vector(const sprixel* s){
-  int pixels = ncplane_pile(s->n)->cellpxy * ncplane_pile(s->n)->cellpxx;
+  int pixels = s->cellpxy * s->cellpxx;
   uint8_t* ret = malloc(sizeof(*ret) * pixels);
   if(ret){
     memset(ret, 0, sizeof(*ret) * pixels);
@@ -18,8 +18,8 @@ int fbcon_wipe(sprixel* s, int ycell, int xcell){
   if(auxvec == NULL){
     return -1;
   }
-  const int cellpxy = ncplane_pile(s->n)->cellpxy;
-  const int cellpxx = ncplane_pile(s->n)->cellpxx;
+  const int cellpxy = s->cellpxy;
+  const int cellpxx = s->cellpxx;
   char* glyph = s->glyph.buf;
   for(int y = 0 ; y < cellpxy ; ++y){
     if(ycell * cellpxy + y >= s->pixy){
@@ -126,8 +126,8 @@ int fbcon_rebuild(sprixel* s, int ycell, int xcell, uint8_t* auxvec){
   if(auxvec == NULL){
     return -1;
   }
-  const int cellpxy = ncplane_pile(s->n)->cellpxy;
-  const int cellpxx = ncplane_pile(s->n)->cellpxx;
+  const int cellpxy = s->cellpxy;
+  const int cellpxx = s->cellpxx;
   sprixcell_e state = SPRIXCELL_TRANSPARENT;
   for(int y = 0 ; y < cellpxy ; ++y){
     if(ycell * cellpxy + y >= s->pixy){
@@ -164,8 +164,8 @@ int fbcon_rebuild(sprixel* s, int ycell, int xcell, uint8_t* auxvec){
 int fbcon_draw(const tinfo* ti, sprixel* s, int y, int x){
   logdebug("id %" PRIu32 " dest %d/%d", s->id, y, x);
   int wrote = 0;
-  const int cellpxy = ncplane_pile(s->n) ? ncplane_pile(s->n)->cellpxy : ti->cellpxy;
-  const int cellpxx = ncplane_pile(s->n) ? ncplane_pile(s->n)->cellpxx : ti->cellpxx;
+  const int cellpxy = ncplane_pile(s->n) ? s->cellpxy : ti->cellpxy;
+  const int cellpxx = ncplane_pile(s->n) ? s->cellpxx : ti->cellpxx;
   for(unsigned l = 0 ; l < (unsigned)s->pixy && l + y * cellpxy < ti->pixy ; ++l){
     // FIXME pixel size isn't necessarily 4B, line isn't necessarily psize*pixx
     size_t offset = ((l + y * cellpxy) * ti->pixx + x * cellpxx) * 4;

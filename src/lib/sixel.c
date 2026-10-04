@@ -658,8 +658,8 @@ int sixel_wipe(sprixel* s, int ycell, int xcell){
   if(auxvec == NULL){
     return -1;
   }
-  const int cellpxy = ncplane_pile(s->n)->cellpxy;
-  const int cellpxx = ncplane_pile(s->n)->cellpxx;
+  const int cellpxy = s->cellpxy;
+  const int cellpxx = s->cellpxx;
   sixelmap* smap = s->smap;
   const int startx = xcell * cellpxx;
   const int starty = ycell * cellpxy;
@@ -1726,8 +1726,8 @@ int sixel_rebuild(sprixel* s, int ycell, int xcell, uint8_t* auxvec){
   if(auxvec == NULL){
     return -1;
   }
-  const int cellpxy = ncplane_pile(s->n)->cellpxy;
-  const int cellpxx = ncplane_pile(s->n)->cellpxx;
+  const int cellpxy = s->cellpxy;
+  const int cellpxx = s->cellpxx;
   sixelmap* smap = s->smap;
   const int startx = xcell * cellpxx;
   const int starty = ycell * cellpxy;

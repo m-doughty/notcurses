@@ -175,6 +175,13 @@ extern "C" {
 #define NCKEY_BUTTON10  preterunicode(210)
 #define NCKEY_BUTTON11  preterunicode(211)
 
+// bracketed paste (fork): the terminal wraps pasted text in these two
+// events when the mode is on, which rendered mode requests at init. The
+// text between them arrives as ordinary input; a newline in it is an
+// NCKEY_ENTER, so a client treats everything between the pair as text.
+#define NCKEY_PASTE_BEGIN preterunicode(300)
+#define NCKEY_PASTE_END   preterunicode(301)
+
 // we received SIGCONT
 #define NCKEY_SIGNAL    preterunicode(400)
 

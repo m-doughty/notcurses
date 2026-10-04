@@ -1242,7 +1242,10 @@ static struct blitset notcurses_blitters[] = {
      .blit = sextant_blit,   .name = "sex",           .fill = false, },
    { .geom = NCBLIT_4x2,     .width = 2, .height = 4,
      .egcs = NCOCTBLOCKS,
-     .plotegcs = (L"\0x20"
+     // " " (U+0020) and 24 glyphs: the 25 levels of a 5x5 plot cell. This
+     // read L"\0x20" -- a NUL and then 'x', '2', '0' -- which pushed every
+     // glyph three levels up and drew literal x, 2 and 0 in octant plots.
+     .plotegcs = (L" "
                   L"\U0001cea0"
                   L"\U00002597"
                   L"\U0001CD96"

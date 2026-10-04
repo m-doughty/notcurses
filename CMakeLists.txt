@@ -893,6 +893,23 @@ add_test(
 )
 set_tests_properties(notcurses-tester PROPERTIES RUN_SERIAL TRUE)
 install(TARGETS notcurses-tester DESTINATION bin)
+# Geometry lifetime tests call private core functions. Link a separate test
+# against the static core rather than exposing implementation symbols in the
+# shared-library ABI. No multimedia backend or terminal pixel support needed.
+add_executable(notcurses-geometry-tester src/tests/internal/sprixelgeometry.cpp)
+target_include_directories(notcurses-geometry-tester PRIVATE
+  include src "${CMAKE_REQUIRED_INCLUDES}" "${PROJECT_BINARY_DIR}/include"
+  "${TERMINFO_INCLUDE_DIRS}")
+target_link_libraries(notcurses-geometry-tester PRIVATE notcurses-core-static
+  "${DEFLATE_LIBRARIES}" "${ZLIB_LIBRARIES}")
+# The static core's libraries reach this link, but its (private) library
+# directories do not: without these, -lncursesw is found only where it is on
+# the default search path (not Homebrew's keg-only ncurses, for one).
+target_link_directories(notcurses-geometry-tester PRIVATE
+  "${TERMINFO_STATIC_LIBRARY_DIRS}" "${DEFLATE_STATIC_LIBRARY_DIRS}"
+  "${ZLIB_STATIC_LIBRARY_DIRS}")
+add_test(NAME notcurses-geometry-tester COMMAND notcurses-geometry-tester)
+set_tests_properties(notcurses-geometry-tester PROPERTIES RUN_SERIAL TRUE)
 else()
   list(FILTER MANSOURCE1 EXCLUDE REGEX "notcurses-tester.1.md")
 endif()

@@ -1,4 +1,5 @@
 #include "main.h"
+#include <string>
 
 TEST_CASE("Output") {
   auto nc_ = testing_notcurses();
@@ -7,6 +8,33 @@ TEST_CASE("Output") {
   }
   ncplane* n_ = notcurses_stdplane(nc_);
   REQUIRE(n_);
+
+  SUBCASE("RenderToBufferBorrowed") {
+    CHECK(10 == ncplane_putstr_yx(n_, 0, 0, "buffer-one"));
+    CHECK(0 == ncpile_render(n_));
+    char* buf = nullptr;
+    size_t buflen = 0;
+    REQUIRE(0 == ncpile_render_to_buffer(n_, &buf, &buflen));
+    REQUIRE(nullptr != buf);
+    CHECK(0 < buflen);
+    CHECK(std::string::npos != std::string(buf, buflen).find("buffer-one"));
+
+    char* borrowed = buf;
+    CHECK(10 == ncplane_putstr_yx(n_, 0, 0, "buffer-two"));
+    CHECK(0 == ncpile_render(n_));
+    REQUIRE(0 == ncpile_render_to_buffer(n_, &buf, &buflen));
+    REQUIRE(nullptr != buf);
+    CHECK(borrowed == buf);
+    CHECK(0 < buflen);
+    CHECK(std::string::npos != std::string(buf, buflen).find("buffer-two"));
+    CHECK(std::string::npos == std::string(buf, buflen).find("buffer-one"));
+
+    REQUIRE(0 == ncpile_render_to_buffer(n_, &buf, &buflen));
+    REQUIRE(nullptr != buf);
+    CHECK(borrowed == buf);
+    CHECK(0 < buflen);
+    CHECK(std::string::npos != std::string(buf, buflen).find("buffer-two"));
+  }
 
   // we ought be able to fill up the plane using any alignment, even if we
   // spill over

@@ -6,9 +6,34 @@
 #include <cstdlib>
 #include <iostream>
 #include <climits>
+#include <string>
 #include <sys/stat.h>
 
-const char* datadir = notcurses_data_dir();
+// (fork) heap-allocated either way (-p, or notcurses_data_dir()); freed
+// before exit, so that leak checkers report only real leaks
+static char* datadir = notcurses_data_dir();
+
+// (fork) argv[0], made absolute while the working directory is still the
+// one it was given relative to; as given if it holds no '/' (it was found on
+// the PATH, and posix_spawnp() will find it there again).
+static std::string self_path;
+
+auto tester_path() -> const char* {
+  return self_path.c_str();
+}
+
+static void
+set_tester_path(const char* argv0){
+  self_path = argv0 ? argv0 : "notcurses-tester";
+#ifndef __MINGW32__
+  if(strchr(self_path.c_str(), '/')){
+    char resolved[PATH_MAX];
+    if(realpath(self_path.c_str(), resolved)){
+      self_path = resolved;
+    }
+  }
+#endif
+}
 
 // we define loglevel for any use of logging in internal header files.
 // note that this has no bearing on the library's true inner loglevel!
@@ -54,6 +79,7 @@ handle_opts(const char** argv){
   bool inarg = false;
   while(*argv){
     if(inarg){
+      free(datadir);
       datadir = strdup(*argv);
       inarg = false;
     }else if(strcmp(*argv, "-p") == 0){
@@ -170,6 +196,14 @@ auto main(int argc, const char **argv) -> int {
     std::cerr << "Couldn't set locale based on user preferences!" << std::endl;
     return EXIT_FAILURE;
   }
+  set_tester_path(argv[0]);
+#ifndef __MINGW32__
+  // (fork) a helper process for a test, not a test run: see input.cpp
+  if(argc == 5 && strcmp(argv[1], "--piped-terminal-child") == 0){
+    loglevel = static_cast<ncloglevel_e>(atoi(argv[4])); // the parent's -l
+    return piped_terminal_child(argv[2], strcmp(argv[3], "locked") == 0);
+  }
+#endif
   lang_and_term(); // might exit
   doctest::Context context;
 
@@ -182,6 +216,8 @@ auto main(int argc, const char **argv) -> int {
   if(res){
     check_data_dir();
   }
+  free(datadir);
+  datadir = nullptr;
   if(context.shouldExit()){ // important - query flags (and --exit) rely on the user doing this
     return res;             // propagate the result of the tests
   }

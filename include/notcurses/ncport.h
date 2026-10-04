@@ -28,8 +28,9 @@ extern "C" {
 #define wcswidth(w, s) (int)(wcslen(w)) // FIXME lol, no
 #elif defined(__MINGW32__)                        // Windows
 #include <string.h>
-#define wcwidth(w) 1 // FIXME lol, no
-#define wcswidth(w, s) (int)(wcslen(w)) // FIXME lol, no
+// (fork) No wcwidth()/wcswidth() stubs here any more: notcurses.h maps both
+// to notcurses_ucs32_width() and notcurses_wcswidth() on MinGW, which answer
+// real widths, surrogate pairs included.
 #define htole(x) (x) // FIXME are all windows installs LE? ugh
 #else                                             // BSDs
 #include <sys/endian.h>

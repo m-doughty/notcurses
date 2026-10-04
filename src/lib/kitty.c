@@ -218,8 +218,8 @@ init_sprixel_animation(sprixel* s){
 // auxiliary vector back into the actual data. we then free the auxvector.
 int kitty_rebuild(sprixel* s, int ycell, int xcell, uint8_t* auxvec){
   const int totalpixels = s->pixy * s->pixx;
-  const int xpixels = ncplane_pile(s->n)->cellpxx;
-  const int ypixels = ncplane_pile(s->n)->cellpxy;
+  const int xpixels = s->cellpxx;
+  const int ypixels = s->cellpxy;
   int targx = xpixels;
   if((xcell + 1) * xpixels > s->pixx){
     targx = s->pixx - xcell * xpixels;
@@ -293,7 +293,7 @@ int kitty_rebuild(sprixel* s, int ycell, int xcell, uint8_t* auxvec){
 // wiping)?
 static inline unsigned
 kitty_anim_auxvec_blitsource_p(const sprixel* s, const uint8_t* auxvec){
-  size_t off = ncplane_pile(s->n)->cellpxy * ncplane_pile(s->n)->cellpxx * 4;
+  size_t off = s->cellpxy * s->cellpxx * 4;
   if(auxvec[off]){
     return 1;
   }
@@ -352,8 +352,8 @@ uint8_t* kitty_trans_auxvec(const ncpile* p){
 // by the wipe proper, and when blitting a new frame with annihilations.
 static int
 kitty_blit_wipe_selfref(sprixel* s, fbuf* f, int ycell, int xcell){
-  const int cellpxx = ncplane_pile(s->n)->cellpxx;
-  const int cellpxy = ncplane_pile(s->n)->cellpxy;
+  const int cellpxx = s->cellpxx;
+  const int cellpxy = s->cellpxy;
   if(fbuf_printf(f, "\x1b_Ga=f,x=%d,y=%d,s=%d,v=%d,i=%d,X=1,r=2,c=1,q=2;",
                  xcell * cellpxx, ycell * cellpxy, cellpxx, cellpxy, s->id) < 0){
     return -1;
@@ -402,7 +402,7 @@ int kitty_wipe_animation(sprixel* s, int ycell, int xcell){
   }
   int tamidx = ycell * s->dimx + xcell;
   uint8_t* auxvec = s->n->tam[tamidx].auxvector;
-  auxvec[ncplane_pile(s->n)->cellpxx * ncplane_pile(s->n)->cellpxy * 4] = 0;
+  auxvec[s->cellpxx * s->cellpxy * 4] = 0;
   s->invalidated = SPRIXEL_INVALIDATED;
   return 1;
 }
@@ -437,7 +437,7 @@ sprixel* kitty_recycle(ncplane* n){
 // in which we stash the alpha.
 static inline uint8_t*
 kitty_auxiliary_vector(const sprixel* s){
-  int pixels = ncplane_pile(s->n)->cellpxy * ncplane_pile(s->n)->cellpxx;
+  int pixels = s->cellpxy * s->cellpxx;
   uint8_t* ret = malloc(sizeof(*ret) * pixels);
   if(ret){
     memset(ret, 0, sizeof(*ret) * pixels);
@@ -452,8 +452,8 @@ int kitty_wipe(sprixel* s, int ycell, int xcell){
     return -1;
   }
   const int totalpixels = s->pixy * s->pixx;
-  const int xpixels = ncplane_pile(s->n)->cellpxx;
-  const int ypixels = ncplane_pile(s->n)->cellpxy;
+  const int xpixels = s->cellpxx;
+  const int ypixels = s->cellpxy;
   // if the cell is on the right or bottom borders, it might only be partially
   // filled by actual graphic data, and we need to cap our target area.
   int targx = xpixels;
@@ -952,8 +952,8 @@ int kitty_rebuild_selfref(sprixel* s, int ycell, int xcell, uint8_t* auxvec){
     return -1;
   }
   fbuf* f = &s->glyph;
-  const int cellpxy = ncplane_pile(s->n)->cellpxy;
-  const int cellpxx = ncplane_pile(s->n)->cellpxx;
+  const int cellpxy = s->cellpxy;
+  const int cellpxx = s->cellpxx;
   const int ystart = ycell * cellpxy;
   const int xstart = xcell * cellpxx;
   const int xlen = xstart + cellpxx > s->pixx ? s->pixx - xstart : cellpxx;
@@ -975,8 +975,8 @@ int kitty_rebuild_animation(sprixel* s, int ycell, int xcell, uint8_t* auxvec){
     return -1;
   }
   fbuf* f = &s->glyph;
-  const int cellpxy = ncplane_pile(s->n)->cellpxy;
-  const int cellpxx = ncplane_pile(s->n)->cellpxx;
+  const int cellpxy = s->cellpxy;
+  const int cellpxx = s->cellpxx;
   const int ystart = ycell * cellpxy;
   const int xstart = xcell * cellpxx;
   const int xlen = xstart + cellpxx > s->pixx ? s->pixx - xstart : cellpxx;

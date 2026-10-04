@@ -119,11 +119,14 @@ TEST_CASE("EGCpool") {
   SUBCASE("ForceReallocation") {
     std::vector<int> candidates;
     char* firstalloc = nullptr;
+    // Code points, not wchar_t: a 16-bit wchar_t (MinGW) wraps at 0x10000,
+    // turning i + 0x80 back into ASCII and NUL, which egcpool_stash()
+    // rightly refuses as single bytes.
     for(auto i = 0u ; i < 1u << 20u ; ++i){
       char mb[MB_LEN_MAX + 1];
-      wchar_t wcs = i + 0x80;
-      auto r = wctomb(mb, wcs);
-      if(r < 0){
+      const uint32_t cp = i + 0x80;
+      auto r = static_cast<int>(nc_c32rtomb(mb, cp));
+      if(r < 0){ // the surrogates are not characters
         candidates.push_back(-1);
         continue;
       }
@@ -140,8 +143,8 @@ TEST_CASE("EGCpool") {
     for(auto i = 0u ; i < candidates.size() ; ++i){
       auto stored = pool_.pool + candidates[i];
       char mb[MB_LEN_MAX + 1];
-      wchar_t wcs = i + 0x80;
-      auto r = wctomb(mb, wcs);
+      const uint32_t cp = i + 0x80;
+      auto r = static_cast<int>(nc_c32rtomb(mb, cp));
       if(r < 0){
         REQUIRE(-1 == candidates[i]);
         continue;

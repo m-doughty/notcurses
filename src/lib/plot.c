@@ -383,10 +383,13 @@ static int redraw_plot_##T(nc##X##plot* ncp){ \
         uint64_t chan = ncp->plot.channels[y]; \
         if(notcurses_canutf8(ncplane_notcurses(ncp->plot.ncp))){ \
           char utf8[MB_LEN_MAX + 1]; \
-          int bytes = wctomb(utf8, egc[sumidx]); \
-          if(bytes < 0){ \
+          /* glyph sumidx, not element sumidx: on MinGW sextants and \
+             octants are surrogate pairs in the wchar_t table */ \
+          const size_t ubytes = nc_c32rtomb(utf8, nc_wtable_at(egc, sumidx)); \
+          if(ubytes == (size_t)-1){ \
             return -1; \
           } \
+          const int bytes = (int)ubytes; \
           utf8[bytes] = '\0'; \
           nccell* c = ncplane_cell_ref_yx(ncp->plot.ncp, dimy - y - 1, x); \
           cell_set_bchannel(c, ncchannels_bchannel(chan)); \

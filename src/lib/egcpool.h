@@ -4,6 +4,8 @@
 #include <wchar.h>
 #include <errno.h>
 #include <stdio.h>
+#include <limits.h>
+#include <stdint.h>
 #include <wctype.h>
 #include <stddef.h>
 #include <assert.h>
@@ -12,6 +14,10 @@
 #include <stdbool.h>
 #include <unigbrk.h>
 #include <unictype.h>
+#ifdef __MINGW32__
+#include <unistr.h>
+#include <uniwidth.h>
+#endif
 #include "notcurses/notcurses.h"
 #include "compat/compat.h"
 #include "logging.h"
@@ -19,6 +25,94 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+// Whole code points. These stand in for mbrtowc(), wcwidth(), wcrtomb(),
+// iswspace() and iswcntrl() wherever one code point is decoded, measured,
+// encoded or classified. Off MinGW each is exactly that C library call. On
+// MinGW wchar_t (and wint_t) is 16 bits: the UCRT decodes every code point
+// beyond the BMP -- emoji, sextants, octants, NCKEY_* -- to U+FFFD, a
+// wchar_t cannot hold one to encode, and there is no wcwidth() at all
+// (ncport.h stubs it to 1, so every glyph measured one column). There,
+// libunistring decodes, encodes and measures.
+
+// Decode one code point from at most 'n' bytes of UTF-8 at 's', never reading
+// past a NUL. Answers the bytes consumed, 0 for a NUL (setting *cp to 0), or
+// (size_t)-1 for an invalid or truncated sequence.
+static inline size_t
+nc_mbrtoc32(uint32_t* cp, const char* s, size_t n){
+#ifdef __MINGW32__
+  if(n == 0){
+    return (size_t)-1;
+  }
+  if(*s == '\0'){
+    *cp = 0;
+    return 0;
+  }
+  ucs4_t uc;
+  const int r = u8_mbtoucr(&uc, (const uint8_t*)s, strnlen(s, n));
+  if(r < 0){ // -1: invalid, -2: truncated
+    return (size_t)-1;
+  }
+  *cp = uc;
+  return r;
+#else
+  mbstate_t mbs;
+  memset(&mbs, 0, sizeof(mbs));
+  wchar_t w;
+  const size_t r = mbrtowc(&w, s, n, &mbs);
+  if(r == (size_t)-1 || r == (size_t)-2){
+    return (size_t)-1;
+  }
+  *cp = (uint32_t)w;
+  return r;
+#endif
+}
+
+// Columns one code point occupies: positive, 0 for a zero-width one, or -1
+// for one that is not printable (a control character).
+static inline int
+nc_c32width(uint32_t cp){
+#ifdef __MINGW32__
+  return uc_width(cp, "UTF-8");
+#else
+  return wcwidth((wchar_t)cp);
+#endif
+}
+
+// Encode one code point into 'out', which must hold MB_LEN_MAX bytes. Answers
+// the bytes written (no NUL is appended), or (size_t)-1 if it cannot be
+// encoded.
+static inline size_t
+nc_c32rtomb(char* out, uint32_t cp){
+#ifdef __MINGW32__
+  const int r = u8_uctomb((uint8_t*)out, cp, MB_LEN_MAX);
+  return r < 0 ? (size_t)-1 : (size_t)r;
+#else
+  mbstate_t mbs;
+  memset(&mbs, 0, sizeof(mbs));
+  return wcrtomb(out, (wchar_t)cp, &mbs);
+#endif
+}
+
+// iswspace() and iswcntrl() for a whole code point. Neither class has a
+// member beyond the BMP, which is all a MinGW wint_t can name.
+static inline bool
+nc_c32space(uint32_t cp){
+#ifdef __MINGW32__
+  return cp <= 0xffff && iswspace((wint_t)cp);
+#else
+  return iswspace((wint_t)cp);
+#endif
+}
+
+static inline bool
+nc_c32cntrl(uint32_t cp){
+#ifdef __MINGW32__
+  return cp <= 0xffff && iswcntrl((wint_t)cp);
+#else
+  return iswcntrl((wint_t)cp);
+#endif
+}
 
 // an nccell only provides storage for up to 4 bytes of an EGC. if there's
 // anything more than that, it's spilled into the egcpool, and the nccell
@@ -98,24 +192,23 @@ utf8_codepoint_length(unsigned char c){
 // columns to '*colcount'. Returns the number of bytes consumed, not including
 // any NUL terminator. Neither the number of bytes nor columns is necessarily
 // equal to the number of decoded code points. Such are the ways of Unicode.
-// uc_is_grapheme_break() wants UTF-32, which is fine, because we need wchar_t
-// to use wcwidth() anyway FIXME except this doesn't work with 16-bit wchar_t!
+// uc_is_grapheme_break() wants UTF-32, and so does measuring: decode whole
+// code points with nc_mbrtoc32(), never through a 16-bit wchar_t.
 static inline int
 utf8_egc_len(const char* gcluster, int* colcount){
   size_t ret = 0;
   *colcount = 0;
   int r;
-  mbstate_t mbt;
-  memset(&mbt, 0, sizeof(mbt));
-  wchar_t wc, prevw = 0;
+  uint32_t wc, prevw = 0;
   bool injoin = false;
   do{
-    r = mbrtowc(&wc, gcluster, MB_LEN_MAX, &mbt);
-    if(r < 0){
+    const size_t s = nc_mbrtoc32(&wc, gcluster, MB_LEN_MAX);
+    if(s == (size_t)-1){
       // FIXME probably ought escape this somehow
       logerror("invalid UTF8: %s", gcluster);
       return -1;
     }
+    r = (int)s;
     // A NUL terminator contributes neither bytes nor columns. The loop's
     // `while(r)` already stops here, but only after the width logic below has
     // run on wc == 0. That is harmless where wcwidth(0) is 0, as POSIX
@@ -132,19 +225,19 @@ utf8_egc_len(const char* gcluster, int* colcount){
     if(uc_is_property_variation_selector(wc)){ // ends EGC
       ret += r;
       break;
-    }else if(wc == L'\u200d' || injoin){ // ZWJ is iswcntrl, so check it first
+    }else if(wc == 0x200d || injoin){ // ZWJ is iswcntrl, so check it first
       injoin = true;
       cols = 0;
     }else{
-      cols = wcwidth(wc);
+      cols = nc_c32width(wc);
       if(cols < 0){
         injoin = false;
-        if(iswspace(wc)){ // newline or tab
+        if(nc_c32space(wc)){ // newline or tab
           *colcount = 1;
           return ret + 1;
         }
         cols = 1;
-        if(iswcntrl(wc)){
+        if(nc_c32cntrl(wc)){
           logerror("prohibited or invalid unicode: 0x%08x", (unsigned)wc);
           return -1;
         }

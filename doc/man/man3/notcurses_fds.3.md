@@ -72,6 +72,15 @@ it is from within the thread's context, or external to that context.
 reliable use of signals (it will never target a process other than the true
 subprocess).
 
+On Windows, where a thread blocked in a read cannot be cancelled, a destroy
+function called from outside the callbacks cancels the reader's pending read
+instead. Should that read refuse to be cancelled for a second, the destroy
+function stops waiting rather than hang: it logs an error and returns -1, and
+the reader thread is left to close the file descriptor and release its memory
+should the read ever complete. Either way, no callback is invoked once the
+destroy function has returned, and a callback already running is still waited
+for.
+
 # RETURN VALUES
 
 # SEE ALSO

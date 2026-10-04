@@ -1,7 +1,10 @@
 #include "termdesc.h"
 #include "internal.h"
 #include "windows.h"
+#include "win32input.h"
 #ifdef __MINGW32__
+#include <io.h>
+#include <fcntl.h>
 int restore_windows_console_input(tinfo* ti){
   if(!ti->input_mode_preserved_valid){
     return 0;
@@ -21,6 +24,18 @@ int restore_windows_console(tinfo* ti){
     ret = -1;
   }
   return ret;
+}
+
+// Mode 9001 is a per-console TerminalInput flag in conhost, not screen-buffer
+// scoped, so it survives smcup/rmcup and needs no re-assertion there; it also
+// survives our exit, so every teardown path that enabled it must disable it.
+// conhost handles the disable itself rather than passing it to the hosting
+// terminal, so the terminal's own win32-input-mode leg is never disturbed.
+int win32_input_mode(tinfo* ti, bool enable){
+  if(ti->ttyfd < 0){
+    return 0;
+  }
+  return tty_emit(enable ? W32IM_ENABLE : W32IM_DISABLE, ti->ttyfd);
 }
 
 // ti has been memset to all zeroes. windows configuration is static.
@@ -132,6 +147,13 @@ int prepare_windows_terminal(tinfo* ti, size_t* tablelen, size_t* tableused){
     return -1;
   }
   loginfo("verified Windows ConPTY");
+  // The queries and the sixel/keyboard setup strings go out through
+  // blocking_write() on ttyfd. Keep it in binary mode for the same reason
+  // notcurses_core_init() puts the frame descriptor there: the UCRT's
+  // text-mode console path emits one character per system call.
+  if(ti->ttyfd >= 0){
+    _setmode(ti->ttyfd, _O_BINARY);
+  }
   // ConPTY intercepts most control sequences. It does pass through XTVERSION
   // (for now), but since it responds to the DA1 itself, we usually get that
   // prior to any XTVERSION response. We instead key off of mintty's pretty

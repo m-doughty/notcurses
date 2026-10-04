@@ -36,6 +36,7 @@
 #include "lib/sprite.h"
 #include "lib/fbuf.h"
 #include "lib/gpm.h"
+#include "lib/fdreader.h"
 
 
 #ifndef __MINGW32__
@@ -199,6 +200,14 @@ typedef struct ncfdplane {
   ncplane* ncp;               // bound ncplane
   pthread_t tid;              // thread servicing this i/o
   bool destroyed;             // set in ncfdplane_destroy() in our own context
+  // (fork) how a destroy from another thread stops the reader: it asks, and
+  // the reader leaves at its next look, which the destroy brings about by
+  // writing to wakepipe (POSIX: the reader poll()s it), or by cancelling the
+  // read() the reader is blocked in (Windows). See fdreader.h and fd.c.
+  fdreader reader;
+#ifndef __MINGW32__
+  int wakepipe[2];
+#endif
 } ncfdplane;
 
 typedef struct ncsubproc {
@@ -206,8 +215,23 @@ typedef struct ncsubproc {
   pid_t pid;                  // subprocess
   int pidfd;                  // for signalling/watching the subprocess
   pthread_t waittid;          // wait()ing thread if pidfd is not available
-  pthread_mutex_t lock;       // guards waited
+  pthread_mutex_t lock;       // guards waited, and (fork) the four below
   bool waited;                // we've wait()ed on it, don't kill/wait further
+  // (fork) destroyed from within one of its callbacks: its threads, which
+  // nobody will join, detach themselves, and the last one out (|live| counts
+  // those yet to finish) frees it all. See subproc_thread_done() in fd.c.
+  bool selfdestroyed;
+  unsigned live;
+  bool readerdone, waiterdone;
+#ifdef __MINGW32__
+  void* hproc;                // (fork) the process HANDLE: the waiter waits on
+                              // it, ncsubproc_destroy() may terminate it
+  void* hreader;              // (fork) our own HANDLE on the reader thread,
+                              // for the waiter's drain wait
+#else
+  int pipewfd;                // (fork) our copy of the pipe's write end, -1 if
+                              // none: closed by ncsubproc_destroy()
+#endif
 } ncsubproc;
 
 typedef struct ncreader {
@@ -324,6 +348,7 @@ typedef struct ncpile {
   size_t crenderlen;          // size of crender vector
   unsigned dimy, dimx;        // rows and cols at last render/creation
   unsigned cellpxx, cellpxy;  // cell-pixel geometry at last render/creation
+  bool pixel_geometry_changed; // synchronized before blit, consumed by render
   int scrolls;                // how many real lines need be scrolled at raster
   sprixel* sprixelcache;      // sorted list of sprixels, assembled during paint
 } ncpile;
@@ -334,6 +359,9 @@ typedef struct notcurses {
 
   // the style state of the terminal is carried across render runs
   rasterstate rstate;
+  // A terminal resize can reflow/move physical cells without changing their
+  // logical contents. Consume this only after a complete frame is written.
+  bool physical_geometry_changed;
 
   // we keep a copy of the last rendered frame. this facilitates O(1)
   // notcurses_at_yx() and O(1) damage detection (at the cost of some memory).
@@ -1489,22 +1517,82 @@ cell_load_direct(ncplane* n, nccell* c, const char* gcluster, int bytes, int col
 // increment y by 1 and rotate the framebuffer up one line. x moves to 0.
 void scroll_down(ncplane* n);
 
+// Both take a whole code point (see nc_mbrtoc32()), not a wchar_t: a 16-bit
+// wchar_t cannot name anything beyond the BMP.
 static inline bool
-islinebreak(wchar_t wchar){
+islinebreak(uint32_t cp){
   // UC_LINE_SEPARATOR + UC_PARAGRAPH_SEPARATOR
-  if(wchar == L'\n' || wchar == L'\v' || wchar == L'\f'){
+  if(cp == '\n' || cp == '\v' || cp == '\f'){
     return true;
   }
   const uint32_t mask = UC_CATEGORY_MASK_Zl | UC_CATEGORY_MASK_Zp;
-  return uc_is_general_category_withtable(wchar, mask);
+  return uc_is_general_category_withtable(cp, mask);
 }
 
 static inline bool
-iswordbreak(wchar_t wchar){
+iswordbreak(uint32_t cp){
   const uint32_t mask = UC_CATEGORY_MASK_Z |
                         UC_CATEGORY_MASK_Zs;
-  return uc_is_general_category_withtable(wchar, mask);
+  return uc_is_general_category_withtable(cp, mask);
 }
+
+// The blitters' glyph tables (struct blitset's egcs and plotegcs) are wchar_t
+// strings built from the public NC*BLOCKS macros. Where wchar_t holds a whole
+// code point, glyph i is element i. Where it is 16 bits (MinGW), every glyph
+// beyond the BMP -- all of the sextants and octants -- is a surrogate pair:
+// glyph i has to be counted out, and neither half is a character that can be
+// searched for or encoded on its own.
+#if WCHAR_MAX > 0xffff
+static inline uint32_t
+nc_wtable_at(const wchar_t* table, size_t idx){
+  return (uint32_t)table[idx];
+}
+
+// The index of the last glyph in 'table' equal to 'cp', or -1: wcsrchr() for
+// whole code points.
+static inline int
+nc_wtable_rfind(const wchar_t* table, uint32_t cp){
+  const wchar_t* w = wcsrchr(table, (wchar_t)cp);
+  return w ? (int)(w - table) : -1;
+}
+#else
+// Decode the glyph at *w, advancing *w past it (one unit, or two for a pair).
+static inline uint32_t
+nc_wtable_next(const wchar_t** w){
+  const uint32_t hi = (uint16_t)**w;
+  ++*w;
+  if(hi >= 0xd800 && hi <= 0xdbff){
+    const uint32_t lo = (uint16_t)**w;
+    if(lo >= 0xdc00 && lo <= 0xdfff){
+      ++*w;
+      return 0x10000 + ((hi - 0xd800) << 10) + (lo - 0xdc00);
+    }
+  }
+  return hi;
+}
+
+static inline uint32_t
+nc_wtable_at(const wchar_t* table, size_t idx){
+  const wchar_t* w = table;
+  while(idx-- && *w){
+    nc_wtable_next(&w);
+  }
+  return *w ? nc_wtable_next(&w) : 0;
+}
+
+static inline int
+nc_wtable_rfind(const wchar_t* table, uint32_t cp){
+  const wchar_t* w = table;
+  int idx = 0, found = -1;
+  while(*w){
+    if(nc_wtable_next(&w) == cp){
+      found = idx;
+    }
+    ++idx;
+  }
+  return cp ? found : idx; // wcsrchr() finds the terminator for NUL
+}
+#endif
 
 // the heart of damage detection. compare two nccells (from two different
 // planes) for equality. if they are equal, return 0. otherwise, dup the second
@@ -1526,6 +1614,11 @@ cellcmp_and_dupfar(egcpool* dampool, nccell* damcell,
 }
 
 int get_tty_fd(FILE* ttyfp);
+
+// (fork) the controlling terminal, freshly opened and nonblocking, for the
+// input thread when stdin is not the terminal; -1 if unavailable. Pollable
+// unless *selectonly is set (then select() watches it).
+int get_tty_input_fd(bool* selectonly);
 
 // Given the four channels arguments, verify that:
 //

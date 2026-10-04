@@ -325,7 +325,9 @@ namespace ncpp
 
 		Plane* get_stdplane (unsigned &y, unsigned &x) noexcept
 		{
-			return new Plane (notcurses_stddim_yx (nc, &y, &x));
+			// (fork) marked as the standard plane, as get_stdplane() marks it:
+			// otherwise deleting the wrapper tried to destroy the plane itself
+			return new Plane (notcurses_stddim_yx (nc, &y, &x), true);
 		}
 
 		Plane* get_top () noexcept;

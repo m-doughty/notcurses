@@ -88,9 +88,11 @@ TEST_CASE("Wide") {
       CHECK(0 < ncplane_at_cursor_cell(n_, &testcell));
       CHECK(!strcmp(nccell_extended_gcluster(n_, &tcell), nccell_extended_gcluster(n_, &testcell)));
       CHECK(0 == testcell.stylemask);
-      wchar_t w;
-      CHECK(0 < mbtowc(&w, nccell_extended_gcluster(n_, &tcell), MB_CUR_MAX));
-      if(wcwidth(w) == 2){
+      // the library's own measure, right for every code point everywhere:
+      // mbtowc() cannot decode one beyond the BMP where wchar_t is 16 bits
+      const int cols = ncstrwidth(nccell_extended_gcluster(n_, &tcell), NULL, NULL);
+      CHECK(0 < cols);
+      if(cols == 2){
         CHECK(2 == testcell.width);
         ++x;
       }else{

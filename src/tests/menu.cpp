@@ -76,6 +76,65 @@ TEST_CASE("Menu") {
     ncmenu_destroy(ncm);
   }
 
+  // A shortcut description is sized from the shortcut's UTF-8 encoding. It
+  // was measured with wcrtomb(NULL, ...), which always answers 1, so any
+  // shortcut of three or more bytes (CJK, emoji, every NCKEY_*) overran its
+  // allocation; and a 16-bit wchar_t (MinGW) could not encode anything beyond
+  // the BMP at all.
+  SUBCASE("ShortcutsBeyondTwoBytes") {
+    struct ncmenu_item items[] = {
+      { .desc = "Middle", .shortcut = ncinput(), },
+      { .desc = "Grin", .shortcut = ncinput(), },
+    };
+    items[0].shortcut.id = 0x4e2d; // three bytes
+    items[0].shortcut.modifiers = NCKEY_MOD_CTRL;
+    items[1].shortcut.id = 0x1f600; // four bytes
+    items[1].shortcut.modifiers = NCKEY_MOD_ALT;
+    struct ncmenu_section sections[] = {
+      { .name = "Wide", .itemcount = 2, .items = items, .shortcut = ncinput(), },
+    };
+    struct ncmenu_options opts{};
+    opts.sections = sections;
+    opts.sectioncount = 1;
+    struct ncmenu* ncm = ncmenu_create(n_, &opts);
+    REQUIRE(nullptr != ncm);
+    REQUIRE(0 == ncmenu_unroll(ncm, 0));
+    // each shortcut glyph appears once in the unrolled section, right after
+    // its modifier prefix
+    struct { const char* glyph; const char* prefix; } want[] = {
+      { "中", "Ctrl+", },
+      { "\U0001F600", "Alt+", },
+    };
+    auto mp = ncmenu_plane(ncm);
+    for(const auto& w : want){
+      int found = 0;
+      for(unsigned y = 0 ; y < ncplane_dim_y(mp) ; ++y){
+        for(unsigned x = 0 ; x < ncplane_dim_x(mp) ; ++x){
+          char* egc = ncplane_at_yx(mp, y, x, nullptr, nullptr);
+          REQUIRE(egc);
+          const bool hit = !strcmp(egc, w.glyph);
+          free(egc);
+          if(!hit){
+            continue;
+          }
+          ++found;
+          const unsigned plen = strlen(w.prefix);
+          REQUIRE(x >= plen);
+          for(unsigned i = 0 ; i < plen ; ++i){
+            egc = ncplane_at_yx(mp, y, x - plen + i, nullptr, nullptr);
+            REQUIRE(egc);
+            CHECK(egc[0] == w.prefix[i]);
+            free(egc);
+          }
+          ++x; // the glyph is two columns wide; don't count its right half
+        }
+      }
+      CHECK(1 == found);
+    }
+    CHECK(0 == notcurses_render(nc_));
+    ncmenu_destroy(ncm);
+  }
+
   // don't call ncmenu_destroy(), invoking destruction in notcurses_stop().
   SUBCASE("MenuNoFree") {
     struct ncmenu_item file_items[] = {

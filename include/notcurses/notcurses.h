@@ -35,6 +35,27 @@ extern "C" {
 #endif
 #define ALLOC __attribute__((malloc)) __attribute__((warn_unused_result))
 
+// (fork) The columns code point 'cp' occupies: what wcwidth() answers for it
+// -- positive, 0 for a zero-width one, -1 for one that cannot be printed --
+// on every platform, including those whose wchar_t cannot hold it.
+API int notcurses_ucs32_width(uint32_t cp);
+
+// (fork) The columns the first 'n' wide characters of 'w' occupy (stopping
+// at a NUL), as wcswidth() answers: -1 if any of them cannot be printed. A
+// UTF-16 surrogate pair is one character, so this is right where wchar_t is
+// 16 bits.
+API int notcurses_wcswidth(const wchar_t* w, size_t n);
+
+#ifdef __MINGW32__
+// (fork) MinGW's C library has neither wcwidth() nor wcswidth(), and its
+// wchar_t is 16 bits. The inline functions and initializers below, and any
+// code that includes this header, get the real thing.
+#undef wcwidth
+#undef wcswidth
+#define wcwidth(c) notcurses_ucs32_width((uint32_t)(c))
+#define wcswidth(w, n) notcurses_wcswidth((w), (size_t)(n))
+#endif
+
 // Get a human-readable string describing the running Notcurses version.
 API const char* notcurses_version(void);
 // Cannot be inline, as we want to get the versions of the actual Notcurses
@@ -1157,7 +1178,9 @@ notcurses_render(struct notcurses* nc){
 // Perform the rendering and rasterization portion of ncpile_render() and
 // ncpile_rasterize(), but do not write the resulting buffer out to the
 // terminal. Using this function, the user can control the writeout process.
-// The returned buffer must be freed by the caller.
+// The returned buffer belongs to notcurses and must not be freed by the caller.
+// It is not NUL-terminated; use *buflen. It is valid only until the next render,
+// rasterize, refresh, or stop on the same notcurses instance.
 API int ncpile_render_to_buffer(struct ncplane* p, char** buf, size_t* buflen)
   __attribute__ ((nonnull (1, 2, 3)));
 
@@ -1371,6 +1394,17 @@ API int notcurses_linesigs_enable(struct notcurses* n)
 // NCKEY_RESIZE event has been read and you're not yet ready to render. The
 // current screen geometry is returned in 'y' and 'x', if they are not NULL.
 API int notcurses_refresh(struct notcurses* n, unsigned* RESTRICT y, unsigned* RESTRICT x)
+  __attribute__ ((nonnull (1)));
+
+// Poll terminal geometry without clearing or rasterizing. Must be called by
+// the same thread that renders/blits. Updates plane geometry (and can invoke
+// resize callbacks); on Windows pixel terminals, schedules bounded XTWINOPS
+// cell-size queries. Never waits for a reply: outputs are the latest known
+// geometry, with zero cell pixels meaning unknown. Output pointers are
+// optional and untouched on error (-1); returns 0 on success. Pending pixel
+// changes remain marked for the next render. Rows/cols exclude app margins.
+API int notcurses_poll_geometry(struct notcurses* n, unsigned* rows, unsigned* cols,
+                               unsigned* cell_y, unsigned* cell_x)
   __attribute__ ((nonnull (1)));
 
 // Extract the Notcurses context to which this plane is attached.

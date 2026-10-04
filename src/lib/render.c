@@ -10,14 +10,14 @@ sig_atomic_t sigcont_seen_for_render = 0;
 // copies that area of the lastframe (damage map) which is shared between the
 // two. new areas are initialized to empty, just like a new plane. lost areas
 // have their egcpool entries purged.
-static nccell*
+static int
 restripe_lastframe(notcurses* nc, unsigned rows, unsigned cols){
   assert(rows);
   assert(cols);
   const size_t size = sizeof(*nc->lastframe) * (rows * cols);
   nccell* tmp = malloc(size);
   if(tmp == NULL){
-    return NULL;
+    return -1;
   }
   size_t copycols = nc->lfdimx > cols ? cols : nc->lfdimx;
   size_t maxlinecopy = sizeof(nccell) * copycols;
@@ -81,6 +81,25 @@ notcurses_resize_internal(ncplane* pp, unsigned* restrict rows, unsigned* restri
   }
   n->stats.s.cell_geo_changes += cgeo_changed;
   n->stats.s.pixel_geo_changes += pgeo_changed;
+  if(cgeo_changed || pgeo_changed){
+    n->physical_geometry_changed = true;
+  }
+  // Geometry probes mix tinfo's blitter scale with the destination pile's
+  // cell dimensions. Synchronize every pile before any client can blit,
+  // retaining the damage edge for its next render (including hidden piles).
+  ncpile* first = ncplane_pile(n->stdplane);
+  // Unchanged geometry is the common case, even with many off-screen piles.
+  if(first->cellpxy != n->tcache.cellpxy || first->cellpxx != n->tcache.cellpxx){
+    ncpile* p = first;
+    do{
+      if(p->cellpxy != n->tcache.cellpxy || p->cellpxx != n->tcache.cellpxx){
+        p->cellpxy = n->tcache.cellpxy;
+        p->cellpxx = n->tcache.cellpxx;
+        p->pixel_geometry_changed = true;
+      }
+      p = p->next;
+    }while(p != first);
+  }
   *rows -= n->margin_t + n->margin_b;
   if(*rows <= 0){
     *rows = 1;
@@ -123,6 +142,17 @@ notcurses_resize(notcurses* n, unsigned* restrict rows, unsigned* restrict cols)
   int ret = notcurses_resize_internal(notcurses_stdplane(n), rows, cols);
   pthread_mutex_unlock(&n->pilelock);
   return ret;
+}
+
+int notcurses_poll_geometry(notcurses* nc, unsigned* rows, unsigned* cols,
+                            unsigned* celly, unsigned* cellx){
+  unsigned r, c;
+  if(notcurses_resize(nc, &r, &c)){ return -1; }
+  if(rows){ *rows = r; }
+  if(cols){ *cols = c; }
+  if(celly){ *celly = nc->tcache.cellpxy; }
+  if(cellx){ *cellx = nc->tcache.cellpxx; }
+  return 0;
 }
 
 void nccell_release(ncplane* n, nccell* c){
@@ -234,8 +264,7 @@ paint_sprixel(ncplane* p, struct crender* rvec, int starty, int startx,
 // the pile's sprixel list, and update the sprixelstack.
 __attribute__ ((nonnull (1, 2, 7))) static void
 paint(ncplane* p, struct crender* rvec, int dstleny, int dstlenx,
-      int dstabsy, int dstabsx, sprixel** sprixelstack,
-      unsigned pgeo_changed){
+      int dstabsy, int dstabsx, sprixel** sprixelstack){
   unsigned y, x, dimy, dimx;
   int offy, offx;
   ncplane_dim_yx(p, &dimy, &dimx);
@@ -258,10 +287,6 @@ paint(ncplane* p, struct crender* rvec, int dstleny, int dstlenx,
   // glyph, but we *do* need to null out any cellregions that we've
   // scribbled upon.
   if(p->sprite){
-    if(pgeo_changed){
-      // do what on failure? FIXME
-      sprixel_rescale(p->sprite, ncplane_pile(p)->cellpxy, ncplane_pile(p)->cellpxx);
-    }
     paint_sprixel(p, rvec, starty, startx, offy, offx, dstleny, dstlenx);
     // decouple from the pile's sixel list
     if(p->sprite->next){
@@ -591,9 +616,9 @@ int ncplane_mergedown(ncplane* restrict src, ncplane* restrict dst,
   }
   init_rvec(rvec, totalcells);
   sprixel* s = NULL;
-  paint(src, rvec, dst->leny, dst->lenx, dst->absy, dst->absx, &s, 0);
+  paint(src, rvec, dst->leny, dst->lenx, dst->absy, dst->absx, &s);
   assert(NULL == s);
-  paint(dst, rvec, dst->leny, dst->lenx, dst->absy, dst->absx, &s, 0);
+  paint(dst, rvec, dst->leny, dst->lenx, dst->absy, dst->absx, &s);
   assert(NULL == s);
 //fprintf(stderr, "Postpaint start (%dx%d)\n", dst->leny, dst->lenx);
   const struct tinfo* ti = &ncplane_notcurses_const(dst)->tcache;
@@ -1276,9 +1301,26 @@ rasterize_core(notcurses* nc, const ncpile* p, fbuf* f, unsigned phase){
 static int
 notcurses_rasterize_inner(notcurses* nc, ncpile* p, fbuf* f, unsigned* asu){
   logdebug("pile %p ymax: %d xmax: %d", p, p->dimy + nc->margin_t, p->dimx + nc->margin_l);
-  // don't write a clearscreen. we only update things that have been changed.
-  // we explicitly move the cursor at the beginning of each output line, so no
-  // need to home it expliticly.
+  if(nc->physical_geometry_changed){
+    // ConPTY and the terminal may have reflowed the previous screen and
+    // relocated the cursor. lastframe remains a logical content cache, but
+    // is no longer evidence of what occupies any physical coordinate.
+    // Clear and repaint text AND graphics in the same output transaction.
+    if(raster_defaults(nc, false, true, f) ||
+       clear_and_home(nc, &nc->tcache, f) ||
+       sprite_clear_all(&nc->tcache, f)){
+      return -1;
+    }
+    for(size_t i = 0 ; i < (size_t)p->dimy * p->dimx ; ++i){
+      p->crender[i].s.damaged = 1;
+    }
+    for(sprixel* s = p->sprixelcache ; s ; s = s->next){
+      if(s->n && s->invalidated != SPRIXEL_HIDE){
+        s->invalidated = SPRIXEL_UNSEEN;
+      }
+    }
+  }
+  // Outside a geometry transition, retain ordinary incremental rendering.
   update_palette(nc, f);
   int scrolls = p->scrolls;
   logdebug("sprixel phase 1");
@@ -1368,6 +1410,7 @@ raster_and_write(notcurses* nc, ncpile* p, fbuf* f){
   if(ret < 0){
     return ret;
   }
+  nc->physical_geometry_changed = false;
   return nc->rstate.f.used;
 }
 
@@ -1490,16 +1533,14 @@ int ncpile_render_to_file(ncplane* n, FILE* fp){
 // which cells were changed. We solve for each coordinate's cell by walking
 // down the z-buffer, looking at intersections with ncplanes. This implies
 // locking down the EGC, the attributes, and the channels for each cell.
-// if |pgeo_changed|, the cell-pixel geometry for the pile has changed
-// since the last render, and thus all sprixels need be rescaled.
 static void
-ncpile_render_internal(ncpile* p, unsigned pgeo_changed){
+ncpile_render_internal(ncpile* p){
   struct crender* rvec = p->crender;
 //fprintf(stderr, "rendering %dx%d\n", p->dimy, p->dimx);
   ncplane* pl = p->top;
   sprixel* sprixel_list = NULL;
   while(pl){
-    paint(pl, rvec, p->dimy, p->dimx, 0, 0, &sprixel_list, pgeo_changed);
+    paint(pl, rvec, p->dimy, p->dimx, 0, 0, &sprixel_list);
     pl = pl->below;
   }
   if(sprixel_list){
@@ -1575,17 +1616,22 @@ int ncpile_render(ncplane* n){
   notcurses* nc = ncplane_notcurses(n);
   ncpile* pile = ncplane_pile(n);
   // update our notion of screen geometry, and render against that
-  unsigned pgeo_changed = 0;
-  notcurses_resize_internal(n, NULL, NULL);
-  if(pile->cellpxy != nc->tcache.cellpxy || pile->cellpxx != nc->tcache.cellpxx){
-    pile->cellpxy = nc->tcache.cellpxy;
-    pile->cellpxx = nc->tcache.cellpxx;
-    pgeo_changed = 1;
+  if(notcurses_resize_internal(n, NULL, NULL)){ return -1; }
+  unsigned pgeo_changed = pile->pixel_geometry_changed;
+  if(pgeo_changed){
+    // Complete all bitmap geometry work before painting any cells. Failed
+    // resizes retain the pending flag and never rasterize a partial frame.
+    for(sprixel* s = pile->sprixelcache ; s ; s = s->next){
+      if(s->n && sprixel_rescale(s, pile->cellpxy, pile->cellpxx)){
+        return -1;
+      }
+    }
   }
   if(engorge_crender_vector(pile)){
     return -1;
   }
-  ncpile_render_internal(pile, pgeo_changed);
+  ncpile_render_internal(pile);
+  pile->pixel_geometry_changed = false;
   clock_gettime(CLOCK_MONOTONIC, &renderdone);
   pthread_mutex_lock(&nc->stats.lock);
     update_render_stats(&renderdone, &start, &nc->stats.s);
@@ -1593,15 +1639,21 @@ int ncpile_render(ncplane* n){
   return 0;
 }
 
-// run the top half of notcurses_render(), and steal the buffer from rstate.
+// Render and rasterize a full frame, borrowing the buffer from rstate.
 int ncpile_render_to_buffer(ncplane* p, char** buf, size_t* buflen){
   if(ncpile_render(p)){
     return -1;
   }
   notcurses* nc = ncplane_notcurses(p);
+  ncpile* pile = ncplane_pile(p);
+  postpaint(nc, &nc->tcache, nc->lastframe, pile->dimy, pile->dimx, pile->crender, &nc->pool);
+  // Like render_to_file, emit the entire frame even if it has not changed.
+  for(size_t i = 0 ; i < (size_t)pile->dimy * pile->dimx ; ++i){
+    pile->crender[i].s.damaged = 1;
+  }
   unsigned useasu = false; // no SUM with file
   fbuf_reset(&nc->rstate.f);
-  int bytes = notcurses_rasterize_inner(nc, ncplane_pile(p), &nc->rstate.f, &useasu);
+  int bytes = notcurses_rasterize_inner(nc, pile, &nc->rstate.f, &useasu);
   pthread_mutex_lock(&nc->stats.lock);
     update_raster_bytes(&nc->stats.s, bytes);
   pthread_mutex_unlock(&nc->stats.lock);

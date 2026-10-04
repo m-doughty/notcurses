@@ -40,13 +40,18 @@ TEST_CASE("Ncpp"
 
   SUBCASE("StdPlane") {
     NotCurses nc{ nopts };
-    auto std1 = nc.get_stdplane();
+    // (fork) get_stdplane() hands back a new wrapper, which is the caller's
+    // to delete -- before stop(), which a wrapper can't outlive
+    std::unique_ptr<Plane> std1{nc.get_stdplane()};
     CHECK(nullptr != std1);
     unsigned y, x;
-    auto std2 = nc.get_stdplane(&y, &x);
+    std::unique_ptr<Plane> std2{nc.get_stdplane(&y, &x)};
     CHECK(nullptr != std2);
     CHECK(0 < x);
     CHECK(0 < y);
+    std2.reset(); // the plane itself is notcurses', and outlives its wrapper
+    std1.reset();
+    CHECK(nullptr != notcurses_stdplane(nc));
     CHECK(nc.stop());
   }
 
@@ -88,7 +93,7 @@ TEST_CASE("Ncpp"
   SUBCASE("VisualFromPlane") {
     NotCurses nc{ nopts };
     {
-      auto n = nc.get_stdplane();
+      std::unique_ptr<Plane> n{nc.get_stdplane()}; // (fork) ours to delete
       uint64_t chan = NCCHANNELS_INITIALIZER(0x22, 0xdd, 0x44, 0, 0, 0);
       n->set_base(" ", 0, chan);
       REQUIRE(n);

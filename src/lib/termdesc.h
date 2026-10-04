@@ -21,6 +21,11 @@ extern "C" {
 // kitty keyboard protocol pop, used at end when kitty is verified.
 #define KKEYBOARD_POP  "\x1b[<u"
 
+// bracketed paste (fork): rendered mode asks the terminal to wrap pasted
+// text in CSI 200~ / CSI 201~, delivered as NCKEY_PASTE_BEGIN/END.
+#define BRACKETED_PASTE_ON  "\x1b[?2004h"
+#define BRACKETED_PASTE_OFF "\x1b[?2004l"
+
 // disable key modifier options; this corresponds to a resource value of
 // "-1", which cannot be set with the [>m sequence. supposedly, "[>m" by
 // itself ought reset all of them, but this doesn't seem to work FIXME.

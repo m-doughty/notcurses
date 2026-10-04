@@ -1,4 +1,18 @@
 #include "internal.h"
+#ifdef __MINGW32__
+#include <unicase.h>
+#endif
+
+// towlower() for a whole code point: a MinGW wint_t is 16 bits, and cannot
+// name a cased letter beyond the BMP (Deseret, Osage, Adlam, ...).
+static inline uint32_t
+c32tolower(uint32_t cp){
+#ifdef __MINGW32__
+  return uc_tolower(cp);
+#else
+  return towlower(cp);
+#endif
+}
 
 // ncmenu_item and ncmenu_section have internal and (minimal) external forms
 typedef struct ncmenu_int_item {
@@ -41,20 +55,18 @@ typedef struct ncmenu {
 // found, -1 is returned, and 'col' is meaningless.
 static int
 mbstr_find_codepoint(const char* s, uint32_t cp, int* col){
-  mbstate_t ps;
-  memset(&ps, 0, sizeof(ps));
   size_t bytes = 0;
   size_t r;
-  wchar_t w;
+  uint32_t w;
   *col = 0;
-  while((r = mbrtowc(&w, s + bytes, MB_CUR_MAX, &ps)) != (size_t)-1 && r != (size_t)-2){
+  while((r = nc_mbrtoc32(&w, s + bytes, MB_LEN_MAX)) != (size_t)-1){
     if(r == 0){
       break;
     }
-    if(towlower(cp) == towlower(w)){
+    if(c32tolower(cp) == c32tolower(w)){
       return bytes;
     }
-    *col += wcwidth(w);
+    *col += nc_c32width(w);
     bytes += r;
   }
   return -1;
@@ -98,30 +110,31 @@ dup_menu_item(ncmenu_int_item* dst, const struct ncmenu_item* src){
   if(ncinput_ctrl_p(&src->shortcut)){
     bytes += strlen(CTLMOD);
   }
-  mbstate_t ps;
-  memset(&ps, 0, sizeof(ps));
-  size_t shortsize = wcrtomb(NULL, src->shortcut.id, &ps);
+  // Encode the shortcut once, and size the allocation from what that wrote.
+  // This used to measure with wcrtomb(NULL, ...), which by definition encodes
+  // L'\0' and so always answered 1: any shortcut of three or more UTF-8 bytes
+  // (CJK, emoji, every NCKEY_*) overran the allocation when it was written.
+  char shortcut[MB_LEN_MAX];
+  const size_t shortsize = nc_c32rtomb(shortcut, src->shortcut.id);
   if(shortsize == (size_t)-1){
     free(dst->desc);
     return -1;
   }
-  bytes += shortsize + 1;
+  bytes += shortsize;
   char* sdup = malloc(bytes);
+  if(sdup == NULL){
+    free(dst->desc);
+    return -1;
+  }
   int n = snprintf(sdup, bytes, "%s%s", ncinput_alt_p(&src->shortcut) ? ALTMOD : "",
                    ncinput_ctrl_p(&src->shortcut) ? CTLMOD : "");
-  if(n < 0 || (size_t)n >= bytes){
+  if(n < 0 || (size_t)n + shortsize >= bytes){
     free(sdup);
     free(dst->desc);
     return -1;
   }
-  memset(&ps, 0, sizeof(ps));
-  size_t mbbytes = wcrtomb(sdup + n, src->shortcut.id, &ps);
-  if(mbbytes == (size_t)-1){ // shouldn't happen
-    free(sdup);
-    free(dst->desc);
-    return -1;
-  }
-  sdup[n + mbbytes] = '\0';
+  memcpy(sdup + n, shortcut, shortsize);
+  sdup[n + shortsize] = '\0';
   dst->shortdesc = sdup;
   dst->shortdesccols = ncstrwidth(dst->shortdesc, NULL, NULL);
   return 0;

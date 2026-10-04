@@ -1061,16 +1061,18 @@ apply_term_heuristics(tinfo* ti, const char* tname, queried_terminals_e qterm,
     return -1;
   }
   tname = newname;
+  // Code points, not L'' literals: a 16-bit wchar_t (MinGW) cannot hold 🬸 or
+  // 𜴀, and there nc_c32width() asks libunistring rather than a stubbed libc.
   // run a wcwidth(⣿) to guarantee libc Unicode 3 support, independent of term
-  if(wcwidth(L'⣿') < 0){
+  if(nc_c32width(0x28ff) < 0){
     ti->caps.braille = false;
   }
   // run a wcwidth(🬸) to guarantee libc Unicode 13 support, independent of term
-  if(wcwidth(L'🬸') < 0){
+  if(nc_c32width(0x1fb38) < 0){
     ti->caps.sextants = false;
   }
   // run a wcwidth(𜴀) to guarantee libc Unicode 16 support, independent of term
-  if(wcwidth(L'𜴀') < 0){
+  if(nc_c32width(0x1cd00) < 0){
     ti->caps.octants = false;
   }
   ti->termname = tname;

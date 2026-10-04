@@ -88,9 +88,16 @@ void sprixel_hide(sprixel* s){
   // otherwise, it'll be killed in the next rendering cycle.
   if(s->invalidated != SPRIXEL_HIDE){
     loginfo("marking sprixel %u hidden", s->id);
+    // a MOVED sprixel has not been redrawn since its plane moved, so its
+    // pixels are still on the terminal at movedfrom, not at the plane's
+    // current position. keep the origin the move recorded, or the scrub
+    // (sixel's only means of removal) damages the wrong cells and the
+    // old graphic survives wherever the new frame's cells match the old.
+    if(s->invalidated != SPRIXEL_MOVED){
+      s->movedfromy = ncplane_abs_y(s->n);
+      s->movedfromx = ncplane_abs_x(s->n);
+    }
     s->invalidated = SPRIXEL_HIDE;
-    s->movedfromy = ncplane_abs_y(s->n);
-    s->movedfromx = ncplane_abs_x(s->n);
     // guard; might have already been replaced
     if(s->n){
       s->n->sprite = NULL;
@@ -127,6 +134,10 @@ sprixel* sprixel_alloc(ncplane* n, int dimy, int dimx){
   ret->n = n;
   ret->dimy = dimy;
   ret->dimx = dimx;
+  if(ncplane_pile(n)){
+    ret->cellpxy = ncplane_pile(n)->cellpxy;
+    ret->cellpxx = ncplane_pile(n)->cellpxx;
+  }
   ret->id = ++sprixelid_nonce;
   ret->needs_refresh = NULL;
   if(ret->id >= 0x1000000){
@@ -224,27 +235,82 @@ int sprite_init(tinfo* t, int fd){
 
 int sprixel_rescale(sprixel* spx, unsigned ncellpxy, unsigned ncellpxx){
   assert(spx->n);
+  if(!ncellpxy || !ncellpxx || !spx->cellpxy || !spx->cellpxx ||
+     spx->pixy <= 0 || spx->pixx <= 0){
+    return -1;
+  }
+  // A client can re-blit between the geometry poll and render. Such an image
+  // already owns a correct TAM; rebuilding it would erase its coverage.
+  if(spx->cellpxy == ncellpxy && spx->cellpxx == ncellpxx){
+    return 0;
+  }
   loginfo("rescaling -> %ux%u", ncellpxy, ncellpxx);
-  // FIXME need adjust for sixel (scale_height)
-  int nrows = (spx->pixy + (ncellpxy - 1)) / ncellpxy;
-  int ncols = (spx->pixx + (ncellpxx - 1)) / ncellpxx;
+  unsigned nrows = (spx->pixy - 1u) / ncellpxy + 1u;
+  unsigned ncols = (spx->pixx - 1u) / ncellpxx + 1u;
+  if(nrows > INT_MAX / ncols ||
+     (size_t)nrows * ncols > SIZE_MAX / sizeof(tament)){
+    return -1;
+  }
   tament* ntam = create_tam(nrows, ncols);
   if(ntam == NULL){
     return -1;
   }
   for(unsigned y = 0 ; y < spx->dimy ; ++y){
     for(unsigned x = 0 ; x < spx->dimx ; ++x){
-      sprite_rebuild(ncplane_notcurses(spx->n), spx, y, x);
+      // Rebuild with the geometry which allocated each auxiliary vector,
+      // even though the destination pile already advertises the new size.
+      if(sprite_rebuild(ncplane_notcurses(spx->n), spx, y, x) < 0){
+        free(ntam);
+        return -1;
+      }
     }
   }
-  ncplane* ncopy = spx->n;
-  destroy_tam(spx->n);
-  // spx->n->tam has been reset, so it will not be resized herein
-  ncplane_resize_simple(spx->n, nrows, ncols);
-  spx->n = ncopy;
-  spx->n->sprite = spx;
-  spx->n->tam = ntam;
+  // Project old coverage conservatively. Only a cell covered entirely by
+  // opaque old cells may suppress text; mixed cells retain normal repaint.
+  const bool sixel = ncplane_notcurses(spx->n)->tcache.pixel_implementation < NCPIXEL_KITTY_STATIC;
+  for(unsigned y = 0 ; y < nrows ; ++y){
+    const uint64_t y0 = (uint64_t)y * ncellpxy;
+    const uint64_t y1 = y0 + ncellpxy;
+    for(unsigned x = 0 ; x < ncols ; ++x){
+      const uint64_t x0 = (uint64_t)x * ncellpxx;
+      const uint64_t x1 = x0 + ncellpxx;
+      bool opaque = y1 <= (unsigned)spx->pixy && x1 <= (unsigned)spx->pixx;
+      bool transparent = true;
+      opaque &= y1 <= (uint64_t)spx->dimy * spx->cellpxy &&
+                x1 <= (uint64_t)spx->dimx * spx->cellpxx;
+      for(uint64_t oy = y0 / spx->cellpxy ; oy < spx->dimy && oy <= (y1 - 1) / spx->cellpxy ; ++oy){
+        for(uint64_t ox = x0 / spx->cellpxx ; ox < spx->dimx && ox <= (x1 - 1) / spx->cellpxx ; ++ox){
+          sprixcell_e state = spx->n->tam[oy * spx->dimx + ox].state;
+          transparent &= state == SPRIXCELL_TRANSPARENT;
+          opaque &= state == SPRIXCELL_OPAQUE_SIXEL || state == SPRIXCELL_OPAQUE_KITTY;
+        }
+      }
+      ntam[y * ncols + x].state = transparent ? SPRIXCELL_TRANSPARENT
+        : opaque ? (sixel ? SPRIXCELL_OPAQUE_SIXEL : SPRIXCELL_OPAQUE_KITTY)
+        : (sixel ? SPRIXCELL_MIXED_SIXEL : SPRIXCELL_MIXED_KITTY);
+    }
+  }
+  ncplane* n = spx->n;
+  tament* oldtam = n->tam;
+  n->tam = NULL;
+  n->sprite = NULL; // resizing must not queue this live image for destruction
+  int ret = ncplane_resize_internal(n, 0, 0, 0, 0, 0, 0, nrows, ncols);
+  n->sprite = spx;
+  if(ret && (n->leny != nrows || n->lenx != ncols)){
+    n->tam = oldtam;
+    free(ntam);
+    return -1;
+  }
+  cleanup_tam(oldtam, spx->dimy, spx->dimx);
+  free(oldtam);
+  n->tam = ntam;
   spx->dimy = nrows;
   spx->dimx = ncols;
-  return 0;
+  spx->cellpxy = ncellpxy;
+  spx->cellpxx = ncellpxx;
+  free(spx->needs_refresh); // indexed by the old TAM dimensions
+  spx->needs_refresh = NULL;
+  spx->invalidated = SPRIXEL_INVALIDATED;
+  ncplane_notcurses(n)->physical_geometry_changed = true;
+  return ret;
 }

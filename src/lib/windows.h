@@ -17,6 +17,11 @@ int prepare_windows_terminal(struct tinfo* ti, size_t* tablelen,
 int restore_windows_console_input(struct tinfo* ti);
 int restore_windows_console(struct tinfo* ti);
 
+// Ask conhost to encode keyboard input as win32-input-mode records (enable),
+// or to stop (disable). Both are no-ops without a console (ttyfd < 0). See
+// win32input.h for the decoding side and the mode's lifetime.
+int win32_input_mode(struct tinfo* ti, bool enable);
+
 #ifdef __cplusplus
 }
 #endif

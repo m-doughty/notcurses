@@ -62,10 +62,12 @@ puttext_line(ncplane* n, ncalign_e align, const char* text, size_t* bytes){
   bytes_leading_ws = cols_leading_ws = 0;
   bytes_leading_break = cols_leading_break = 0;
   while(cols <= avail){    // we can print everything we've read, if desired
-    mbstate_t mbstate = {0};
-    wchar_t w;
-    const size_t consumed = mbrtowc(&w, text + b, MB_CUR_MAX, &mbstate);
-    if(consumed == (size_t)-2 || consumed == (size_t)-1){
+    uint32_t w;
+    // MB_LEN_MAX, not MB_CUR_MAX: text is NUL-terminated, so the larger bound
+    // reads no further, and a locale whose MB_CUR_MAX is 1 cannot truncate a
+    // UTF-8 sequence into an error
+    const size_t consumed = nc_mbrtoc32(&w, text + b, MB_LEN_MAX);
+    if(consumed == (size_t)-1){
       logerror("invalid UTF-8 after %d bytes", b);
       return -1;
     }
@@ -96,7 +98,7 @@ puttext_line(ncplane* n, ncalign_e align, const char* text, size_t* bytes){
       return cols;
     }
     b += consumed;
-    int width = wcwidth(w);
+    int width = nc_c32width(w);
     if(width < 0){
       width = 0; // FIXME
     }

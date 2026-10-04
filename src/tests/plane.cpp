@@ -1038,10 +1038,14 @@ TEST_CASE("Plane") {
     c = -1;
     do{
       ++c;
+      // tab first: it expands to the next tab stop, and the Microsoft CRT
+      // counts it as printable (_BLANK), which sent it down the one-column
+      // branch below on Windows
+      if(c == '\t'){
+        continue;
+      }
       if(c && !isprint(c)){
-        if(c != '\t'){
-          CHECK(0 > ncplane_putchar_yx(n_, 0, 0, c));
-        }
+        CHECK(0 > ncplane_putchar_yx(n_, 0, 0, c));
       }else{
         CHECK(1 == ncplane_putchar_yx(n_, 0, 0, c));
       }

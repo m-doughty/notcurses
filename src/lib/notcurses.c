@@ -18,6 +18,9 @@
 #include "unixsig.h"
 #include "banner.h"
 #include "windows.h"
+#ifdef __MINGW32__
+#include <io.h>
+#endif
 
 #define ESC "\x1b"
 #define TABSTOP 8
@@ -156,6 +159,12 @@ notcurses_stop_minimal(void* vnc, void** altstack, int errret){
     // before returning to the regular screen if we're in the alternate. if
     // we drained input, we never sent a keyboard modifier; send none now.
     if(!(nc->flags & NCOPTION_DRAIN_INPUT)){
+      ret |= tty_emit(BRACKETED_PASTE_OFF, nc->tcache.ttyfd);
+#ifdef __MINGW32__
+      // before the console modes are restored below: VT output must still be
+      // interpreted for conhost to see this
+      ret |= win32_input_mode(&nc->tcache, false);
+#endif
       if(nc->tcache.kbdlevel){
         if(tty_emit(KKEYBOARD_POP, nc->tcache.ttyfd)){
           ret = -1;
@@ -427,6 +436,19 @@ int update_term_dimensions(unsigned* rows, unsigned* cols, tinfo* tcache,
     *rows = tcache->default_rows;
     *cols = tcache->default_cols;
   }
+  if(tcache->pixel_draw && tcache->ictx){
+    unsigned cy = tcache->cellpxy, cx = tcache->cellpxx;
+    if(inputlayer_poll_cell_geometry(tcache->ictx, tcache->ttyfd, &cy, &cx)){
+      return -1;
+    }
+    if(cy && cx && *rows <= INT_MAX / cy && *cols <= INT_MAX / cx){
+      *pgeo_changed = cy != tcache->cellpxy || cx != tcache->cellpxx;
+      tcache->cellpxy = cy;
+      tcache->cellpxx = cx;
+      tcache->pixy = *rows * cy;
+      tcache->pixx = *cols * cx;
+    }
+  }
 #endif
   if(tcache->dimy != *rows){
     tcache->dimy = *rows;
@@ -448,6 +470,8 @@ int update_term_dimensions(unsigned* rows, unsigned* cols, tinfo* tcache,
       tcache->sixel_maxy = tcache->sixel_maxy_pristine;
     }
   }
+  inputlayer_set_geometry(tcache->ictx, *rows, *cols,
+                          tcache->cellpxy, tcache->cellpxx);
   return 0;
 }
 
@@ -535,6 +559,7 @@ make_ncpile(notcurses* nc, ncplane* n){
     ret->dimx = nc->tcache.dimx;
     ret->cellpxy = nc->tcache.cellpxy;
     ret->cellpxx = nc->tcache.cellpxx;
+    ret->pixel_geometry_changed = false;
     ret->crender = NULL;
     ret->crenderlen = 0;
     ret->sprixelcache = NULL;
@@ -1243,6 +1268,19 @@ notcurses_early_init(const struct notcurses_options* opts, FILE* fp, unsigned* u
   reset_stats(&ret->stats.s);
   reset_stats(&ret->stashed_stats);
   ret->ttyfp = fp;
+#ifdef __MINGW32__
+  // Every frame goes out through write(2) on this descriptor, which the UCRT
+  // opens in text mode. With a locale set (done just above), the UCRT's
+  // text-mode console path translates and writes ONE CHARACTER PER WriteFile
+  // call: a 30KB frame took over a second through ConPTY (measured ~20KB/s),
+  // and every sprixel re-emission paid it. Binary mode writes the buffer in
+  // a single call. Nothing we emit wants the text-mode LF -> CRLF rewrite;
+  // the frame positions the cursor explicitly. get_tty_fd() dup()s this
+  // descriptor later, and the dup inherits the mode.
+  if(fileno(fp) >= 0){
+    _setmode(fileno(fp), _O_BINARY);
+  }
+#endif
   egcpool_init(&ret->pool);
   if(ret->loglevel > NCLOGLEVEL_TRACE || ret->loglevel < NCLOGLEVEL_SILENT){
     fprintf(stderr, "invalid loglevel %d", ret->loglevel);
@@ -1411,6 +1449,27 @@ notcurses* notcurses_core_init(const notcurses_options* opts, FILE* outfp){
       goto err;
     }
   }
+  // (fork) bracketed paste: the terminal wraps pasted text in CSI 200~ and
+  // CSI 201~, delivered as NCKEY_PASTE_BEGIN/END, so a client can tell a
+  // pasted newline from the Enter key. Rendered mode only: an ncdirect
+  // client would see the brackets as keystrokes. Undone in
+  // notcurses_stop_minimal().
+  if(ret->tcache.ttyfd >= 0 && !(ret->flags & NCOPTION_DRAIN_INPUT)){
+    if(tty_emit(BRACKETED_PASTE_ON, ret->tcache.ttyfd)){
+      logwarn("couldn't enable bracketed paste");
+    }
+  }
+#ifdef __MINGW32__
+  // Last, deliberately: every query rendered mode ever sends (the initial
+  // burst in interrogate_terminfo() and the locate_cursor() calls above) has
+  // been answered by now, so a conhost that encodes its replies as key records
+  // can no longer confuse the response automaton. See win32input.h.
+  if(!(ret->flags & NCOPTION_DRAIN_INPUT)){
+    if(win32_input_mode(&ret->tcache, true)){
+      logwarn("couldn't enable win32-input-mode");
+    }
+  }
+#endif
   return ret;
 
 err:{
@@ -3132,19 +3191,13 @@ int ncdirect_inputready_fd(ncdirect* n){
 // given an egc, get its index in the blitter's EGC set
 static int
 get_blitter_egc_idx(const struct blitset* bset, const char* egc){
-  wchar_t wc;
-  mbstate_t mbs = {0};
-  size_t sret = mbrtowc(&wc, egc, strlen(egc), &mbs);
-  if(sret == (size_t)-1 || sret == (size_t)-2){
+  uint32_t cp;
+  if(nc_mbrtoc32(&cp, egc, strlen(egc)) == (size_t)-1){
     return -1;
   }
-  const wchar_t* wptr = wcsrchr(bset->egcs, wc);
-  if(wptr == NULL){
-//fprintf(stderr, "FAILED TO FIND [%s] (%lc) in [%ls]\n", egc, wc, bset->egcs);
-    return -1;
-  }
-//fprintf(stderr, "FOUND [%s] (%lc) in [%ls] (%zu)\n", egc, wc, bset->egcs, wptr - bset->egcs);
-  return wptr - bset->egcs;
+  // a whole code point, searched glyph by glyph: on MinGW every sextant and
+  // octant is a surrogate pair in bset->egcs, invisible to wcsrchr()
+  return nc_wtable_rfind(bset->egcs, cp);
 }
 
 static bool
@@ -3357,6 +3410,33 @@ int ncstrwidth(const char* egcs, int* validbytes, int* validwidth){
     *validwidth += thesecols;
   }while(*egcs);
   return *validwidth;
+}
+
+// (fork) wcwidth() for a whole code point, everywhere: see notcurses.h.
+int notcurses_ucs32_width(uint32_t cp){
+  return nc_c32width(cp);
+}
+
+// (fork) wcswidth() that takes a UTF-16 surrogate pair as the one character
+// it is, where wchar_t is 16 bits: see notcurses.h.
+int notcurses_wcswidth(const wchar_t* w, size_t n){
+  int cols = 0;
+  size_t i = 0;
+  while(i < n && w[i]){
+    uint32_t cp = (uint32_t)w[i++];
+#if WCHAR_MAX <= 0xffff
+    if(cp >= 0xd800 && cp <= 0xdbff && i < n
+       && (uint32_t)w[i] >= 0xdc00 && (uint32_t)w[i] <= 0xdfff){
+      cp = 0x10000 + ((cp - 0xd800) << 10) + ((uint32_t)w[i++] - 0xdc00);
+    }
+#endif
+    const int c = nc_c32width(cp);
+    if(c < 0){
+      return -1;
+    }
+    cols += c;
+  }
+  return cols;
 }
 
 void ncplane_pixel_geom(const ncplane* n,

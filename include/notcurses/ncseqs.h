@@ -55,7 +55,7 @@ extern "C" {
 #define NCEIGHTHSR L"▕🮇🮈▐🮉🮊🮋█"
 #define NCHALFBLOCKS L" ▀▄█"
 #define NCQUADBLOCKS L" ▘▝▀▖▌▞▛▗▚▐▜▄▙▟█"
-#define NCSEXBLOCKS  L" 🬀🬁🬂🬃🬄🬅🬆🬇🬈🬊🬋🬌🬍🬎🬏🬐🬑🬒🬓▌🬔🬕🬖🬗🬘🬙🬚🬛🬜🬝🬞🬟🬠🬡🬢🬣🬤🬥🬦🬧▐🬨🬩🬪🬫🬬🬭🬮🬯🬰🬱🬲🬳🬴🬵🬶🬷🬸🬹🬺🬻█"
+#define NCSEXBLOCKS  L" 🬀🬁🬂🬃🬄🬅🬆🬇🬈🬉🬊🬋🬌🬍🬎🬏🬐🬑🬒🬓▌🬔🬕🬖🬗🬘🬙🬚🬛🬜🬝🬞🬟🬠🬡🬢🬣🬤🬥🬦🬧▐🬨🬩🬪🬫🬬🬭🬮🬯🬰🬱🬲🬳🬴🬵🬶🬷🬸🬹🬺🬻█"
 #define NCOCTBLOCKS \
  L" \U0001CEA8\U0001CEAB\U0001FB82\U0001CD00\U00002598\U0001CD01\U0001CD02"\
   "\U0001CD03\U0001CD04\U0000259D\U0001CD05\U0001CD06\U0001CD07\U0001CD08\U00002580"\

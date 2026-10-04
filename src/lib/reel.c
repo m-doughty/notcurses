@@ -234,11 +234,16 @@ tablet_geom(const ncreel* nr, nctablet* t, int* begx, int* begy,
   return 0;
 }
 
-// kill the planes associated with |t|
+// kill the planes associated with |t|. (fork) Its border plane's widget
+// destructor is nctablet_delete_internal(), which frees |t|: so the plane is
+// unbound from |t| first, and |t| survives -- the reel decides when tablets
+// go. Every place that drops a tablet's planes goes through here; destroying
+// t->p directly freed the tablet, and the very next write to t->p was a
+// use-after-free (trim_reel_overhang(), at some reel heights).
 static void
 nctablet_wipeout(nctablet* t){
   if(t){
-    if(ncplane_set_widget(t->p, NULL, NULL) == 0){
+    if(t->p && ncplane_set_widget(t->p, NULL, NULL) == 0){
       ncplane_family_destroy(t->p);
     }
     t->p = NULL;
@@ -361,8 +366,7 @@ ncreel_draw_tablet(const ncreel* nr, nctablet* t, int frontiertop,
     t->cbp = ncplane_create(t->p, &dnopts);
     if(t->cbp == NULL){
 //fprintf(stderr, "failure creating data plane %d %d %d %d\n", cbleny, cblenx, cby, cbx);
-      ncplane_destroy(t->p);
-      t->p = NULL;
+      nctablet_wipeout(t); // (fork) not ncplane_destroy(): see there
       return -1;
     }
     ncplane_move_above(t->cbp, t->p);
@@ -491,17 +495,13 @@ trim_reel_overhang(ncreel* r, nctablet* top, nctablet* bottom){
 //fprintf(stderr, "top: %dx%d @ %d, miny: %d\n", ylen, xlen, y, miny);
   if(boty < miny){
 //fprintf(stderr, "NUKING top!\n");
-    ncplane_family_destroy(top->p);
-    top->p = NULL;
-    top->cbp = NULL;
+    nctablet_wipeout(top); // (fork) keeps the tablet: see nctablet_wipeout()
     top = top->next;
     return trim_reel_overhang(r, top, bottom);
   }else if(y < miny){
     int ynew = ylen - (miny - y);
     if(ynew <= 0){
-      ncplane_family_destroy(top->p);
-      top->p = NULL;
-      top->cbp = NULL;
+      nctablet_wipeout(top);
     }else{
       if(ncplane_resize(top->p, miny - y, 0, ynew, xlen, 0, 0, ynew, xlen)){
         return -1;
@@ -531,19 +531,13 @@ trim_reel_overhang(ncreel* r, nctablet* top, nctablet* bottom){
   //fprintf(stderr, "bot: %dx%d @ %d, maxy: %d\n", ylen, xlen, y, maxy);
     if(maxy < y){
   //fprintf(stderr, "NUKING bottom!\n");
-      if(ncplane_set_widget(bottom->p, NULL, NULL) == 0){
-        ncplane_family_destroy(bottom->p);
-      }
-      bottom->p = NULL;
-      bottom->cbp = NULL;
+      nctablet_wipeout(bottom);
       bottom = bottom->prev;
       return trim_reel_overhang(r, top, bottom);
     }if(maxy < boty){
       int ynew = ylen - (boty - maxy);
       if(ynew <= 0){
-        ncplane_family_destroy(bottom->p);
-        bottom->p = NULL;
-        bottom->cbp = NULL;
+        nctablet_wipeout(bottom); // (fork) keeps the tablet, as above
       }else{
         if(ncplane_resize(bottom->p, 0, 0, ynew, xlen, 0, 0, ynew, xlen)){
           return -1;
@@ -880,10 +874,18 @@ nctablet* ncreel_add(ncreel* nr, nctablet* after, nctablet *before,
 void ncreel_destroy(ncreel* nreel){
   if(nreel){
     if(ncplane_set_widget(nreel->p, NULL, NULL) == 0){
+      // (fork) not through ncreel_del(), whose redraw after every deletion
+      // is pointless here, and wrote to a freed tablet (trim_reel_overhang())
+      // once the focus had been moved past the last of them
       nctablet* t;
       while( (t = nreel->tablets) ){
-        ncreel_del(nreel, t);
+        if((nreel->tablets = t->next) == t){
+          nreel->tablets = NULL;
+        }
+        nctablet_delete_internal(t);
       }
+      nreel->vft = NULL;
+      nreel->tabletcount = 0;
       ncplane_destroy(nreel->p);
     }
     free(nreel);

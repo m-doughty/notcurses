@@ -2,11 +2,25 @@
 #include <fcntl.h>
 #include <stdatomic.h>
 #include <unistd.h>
+#ifdef __APPLE__
+#include <sys/select.h>
+#endif
 #include "automaton.h"
 #include "internal.h"
 #include "unixsig.h"
 #include "render.h"
 #include "in.h"
+#include "win32input.h"
+#include "cellgeometry.h"
+
+// (fork) The read buffers and the ncinput queue were sized by BUFSIZ, which
+// is 8192 with glibc but 1024 on macOS and 512 on Windows' UCRT, so a paste
+// of a few hundred characters could overflow the queue on Windows before the
+// client's next read. Fixed sizes make every platform behave the same, and
+// since the queue no longer drops when full (ncinput_queue_full()) they
+// only tune throughput: bytes per read, and events held for the client.
+#define NCINPUT_READ_BUFSIZE 8192
+#define NCINPUT_QUEUE_SLOTS  8192
 
 // Notcurses takes over stdin, and if it is not connected to a terminal, also
 // tries to make a connection to the controlling terminal. If such a connection
@@ -53,13 +67,18 @@ typedef HANDLE ipipe;
 typedef struct inputctx {
   // these two are not ringbuffers; we always move any leftover materia to the
   // front of the queue (it ought be a handful of bytes at most).
-  unsigned char tbuf[BUFSIZ]; // only used if we have distinct terminal fd
-  unsigned char ibuf[BUFSIZ]; // might be intermingled bulk/control data
+  unsigned char tbuf[NCINPUT_READ_BUFSIZE]; // only used if we have distinct terminal fd
+  unsigned char ibuf[NCINPUT_READ_BUFSIZE]; // might be intermingled bulk/control data
 
   int stdinfd;          // bulk in fd. always >= 0 (almost always 0). we do not
                         //  own this descriptor, and must not close() it.
   int termfd;           // terminal fd: -1 with no controlling terminal, or
                         //  if stdin is a terminal, or on MSFT Terminal.
+                        //  (fork) nonblocking (get_tty_input_fd()).
+  bool termdead;        // (fork) termfd hung up, failed, or can't be polled:
+                        //  no longer waited on (input thread only)
+  bool termselect;      // (fork) termfd is waited on with select(), not
+                        //  poll() (macOS's /dev/tty: get_tty_input_fd())
 #ifdef __MINGW32__
   HANDLE stdinhandle;   // handle to input terminal for MSFT Terminal
 #endif
@@ -86,6 +105,8 @@ typedef struct inputctx {
   int cread, iread;   // slot from which clients read the next csr/input;
                       //  they cannot read if valid == 0
   pthread_mutex_t ilock; // lock for ncinput ringbuffer, also initial state
+  cellgeometry cellgeom; // runtime reports/query state, guarded by ilock
+  unsigned mouse_rows, mouse_cols, mouse_celly, mouse_cellx; // also ilock
   pthread_cond_t icond;  // condvar for ncinput ringbuffer
   pthread_mutex_t clock; // lock for csrs ringbuffer
   pthread_cond_t ccond;  // condvar for csrs ringbuffer
@@ -94,6 +115,10 @@ typedef struct inputctx {
 
   unsigned midescape; // we're in the middle of a potential escape. we need
                       //  to do a nonblocking read and try to complete it.
+  // (fork) CLOCK_MONOTONIC nanoseconds until which the partial escape at the
+  // front of ibuf is held for the rest of its bytes, or 0 when none is being
+  // held (hold_partial_escape()). Input thread only.
+  uint64_t escdeadline;
   unsigned stdineof;  // have we seen an EOF on stdin?
   _Atomic bool stopping; // cooperative shutdown (required on Windows)
 #ifdef __MINGW32__
@@ -103,6 +128,12 @@ typedef struct inputctx {
   // Is stdinhandle a real console? If not (redirected file/pipe) there are no
   // INPUT_RECORDs to peek at, and block_on_input() must not gate reads on them.
   bool stdinconsole;
+  // (fork) Brackets the blocking ReadFile() in read_windows_console(), so that
+  // stop_inputlayer() cancels only that read, and can give up on one that
+  // won't cancel (fdreader.h). Set once the thread owns this context, after
+  // stop_inputlayer() gave up on it: it frees it on its way out.
+  fdreader reader;
+  bool abandoned;
 #endif
 
   unsigned linesigs;  // are line discipline signals active?
@@ -126,6 +157,7 @@ typedef struct inputctx {
   // a waiter freeing the response structure.
   _Atomic bool initdata_timeout;
   int kittykbd;        // kitty keyboard protocol support level
+  w32im_state w32im;   // win32-input-mode transcoder state (win32input.h)
   bool failed;         // error initializing input automaton, abort
 } inputctx;
 
@@ -556,7 +588,7 @@ load_ncinput(inputctx* ictx, ncinput *tni){
     ni->id = NCKEY_BACKSPACE;
   }else if(ni->id == '\n' || ni->id == '\r'){
     ni->id = NCKEY_ENTER;
-  }else if(ni->id == ictx->backspace){
+  }else if(ictx->backspace && ni->id == ictx->backspace){
     ni->id = NCKEY_BACKSPACE;
   }else if(ni->id > 0 && ni->id <= 26 && ni->id != '\t'){
     ni->id = ni->id + 'A' - 1;
@@ -576,17 +608,21 @@ load_ncinput(inputctx* ictx, ncinput *tni){
 
 static void
 pixelmouse_click(inputctx* ictx, ncinput* ni, long y, long x){
+  pthread_mutex_lock(&ictx->ilock);
+  unsigned celly = ictx->mouse_celly, cellx = ictx->mouse_cellx;
+  unsigned rows = ictx->mouse_rows, cols = ictx->mouse_cols;
+  pthread_mutex_unlock(&ictx->ilock);
   --x;
   --y;
-  if(ictx->ti->cellpxy == 0 || ictx->ti->cellpxx == 0){
+  if(celly == 0 || cellx == 0){
     logerror("pixelmouse event without pixel info (%ld/%ld)", y, x);
     inc_input_errors(ictx);
     return;
   }
-  ni->ypx = y % ictx->ti->cellpxy;
-  ni->xpx = x % ictx->ti->cellpxx;
-  y /= ictx->ti->cellpxy;
-  x /= ictx->ti->cellpxx;
+  ni->ypx = y % celly;
+  ni->xpx = x % cellx;
+  y /= celly;
+  x /= cellx;
   x -= ictx->lmargin;
   y -= ictx->tmargin;
   // convert from 1- to 0-indexing, and account for margins
@@ -594,11 +630,11 @@ pixelmouse_click(inputctx* ictx, ncinput* ni, long y, long x){
     logwarn("dropping click in margins %ld/%ld", y, x);
     return;
   }
-  if((unsigned)x >= ictx->ti->dimx - (ictx->rmargin + ictx->lmargin)){
+  if((unsigned)x + ictx->rmargin + ictx->lmargin >= cols){
     logwarn("dropping click in margins %ld/%ld", y, x);
     return;
   }
-  if((unsigned)y >= ictx->ti->dimy - (ictx->bmargin + ictx->tmargin)){
+  if((unsigned)y + ictx->bmargin + ictx->tmargin >= rows){
     logwarn("dropping click in margins %ld/%ld", y, x);
     return;
   }
@@ -646,11 +682,11 @@ mouse_click(inputctx* ictx, unsigned release, char follow){
     }
   }
   if(ictx->ti->pixelmice){
-    if(ictx->ti->cellpxx == 0){
-      logerror("pixelmouse but no pixel info");
-    }
     return pixelmouse_click(ictx, &tni, y, x);
   }
+  pthread_mutex_lock(&ictx->ilock);
+  unsigned rows = ictx->mouse_rows, cols = ictx->mouse_cols;
+  pthread_mutex_unlock(&ictx->ilock);
   x -= (1 + ictx->lmargin);
   y -= (1 + ictx->tmargin);
   // convert from 1- to 0-indexing, and account for margins
@@ -658,11 +694,11 @@ mouse_click(inputctx* ictx, unsigned release, char follow){
     logwarn("dropping click in margins %ld/%ld", y, x);
     return;
   }
-  if((unsigned)x >= ictx->ti->dimx - (ictx->rmargin + ictx->lmargin)){
+  if((unsigned)x + ictx->rmargin + ictx->lmargin >= cols){
     logwarn("dropping click in margins %ld/%ld", y, x);
     return;
   }
-  if((unsigned)y >= ictx->ti->dimy - (ictx->bmargin + ictx->tmargin)){
+  if((unsigned)y + ictx->bmargin + ictx->tmargin >= rows){
     logwarn("dropping click in margins %ld/%ld", y, x);
     return;
   }
@@ -719,9 +755,20 @@ cursor_location_cb(inputctx* ictx){
 
 static int
 geom_cb(inputctx* ictx){
-  unsigned kind = amata_next_numeric(&ictx->amata, "\x1b[", ';');
-  unsigned y = amata_next_numeric(&ictx->amata, "", ';');
-  unsigned x = amata_next_numeric(&ictx->amata, "", 't');
+  unsigned kind, y, x;
+  if(!cellgeometry_parse(ictx->amata.matchstart, ictx->amata.used, &kind, &y, &x)){
+    logwarn("invalid terminal geometry report");
+    return 2; // consume the report, never replay its digits as user input
+  }
+  if(kind == 6){
+    pthread_mutex_lock(&ictx->ilock);
+    cellgeometry_observe(&ictx->cellgeom, y, x);
+    // Pixel mouse events following this reply use the same new cell size.
+    ictx->mouse_celly = y;
+    ictx->mouse_cellx = x;
+    pthread_mutex_unlock(&ictx->ilock);
+    return 2;
+  }
   if(kind == 4){ // pixel geometry
     if(ictx->initdata){
       ictx->initdata->pixy = y;
@@ -739,6 +786,39 @@ geom_cb(inputctx* ictx){
     return -1;
   }
   return 2;
+}
+
+void inputlayer_set_geometry(inputctx* ictx, unsigned rows, unsigned cols,
+                             unsigned y, unsigned x){
+  if(!ictx){ return; }
+  pthread_mutex_lock(&ictx->ilock);
+  ictx->mouse_rows = rows;
+  ictx->mouse_cols = cols;
+  // A newer terminal report may already be waiting for the owner to poll.
+  ictx->mouse_celly = ictx->cellgeom.y ? ictx->cellgeom.y : y;
+  ictx->mouse_cellx = ictx->cellgeom.x ? ictx->cellgeom.x : x;
+  pthread_mutex_unlock(&ictx->ilock);
+}
+
+int inputlayer_poll_cell_geometry(inputctx* ictx, int fd,
+                                  unsigned* y, unsigned* x){
+  if(!ictx || fd < 0){ return -1; }
+  struct timespec ts;
+  if(clock_gettime(CLOCK_MONOTONIC, &ts)){ return -1; }
+  uint64_t now = (uint64_t)ts.tv_sec * UINT64_C(1000000000) + ts.tv_nsec;
+  pthread_mutex_lock(&ictx->ilock);
+  int query = cellgeometry_query_due(&ictx->cellgeom, now);
+  if(ictx->cellgeom.y && ictx->cellgeom.x){
+    *y = ictx->cellgeom.y;
+    *x = ictx->cellgeom.x;
+  }
+  pthread_mutex_unlock(&ictx->ilock);
+  if(query == 2){
+    logwarn("no cell pixel-size replies; backing off geometry queries to 30s");
+  }else if(query == 1 && tty_emit("\x1b[16t", fd)){
+    return -1;
+  }
+  return 0;
 }
 
 static void
@@ -970,6 +1050,23 @@ legacy_functional(uint32_t id){
 static int
 simple_cb_begin(inputctx* ictx){
   kitty_kbd(ictx, NCKEY_BEGIN, 0, 0);
+  return 2;
+}
+
+// bracketed paste (fork): CSI 200~ and CSI 201~ bracket pasted text once
+// BRACKETED_PASTE_ON has been sent. They are delivered as two synthesized
+// keys so a client can take everything between them as text rather than
+// keystrokes -- a pasted newline arrives as NCKEY_ENTER, which would
+// otherwise submit a chat composer once per line.
+static int
+paste_begin_cb(inputctx* ictx){
+  kitty_kbd(ictx, NCKEY_PASTE_BEGIN, 0, 0);
+  return 2;
+}
+
+static int
+paste_end_cb(inputctx* ictx){
+  kitty_kbd(ictx, NCKEY_PASTE_END, 0, 0);
   return 2;
 }
 
@@ -1829,6 +1926,8 @@ build_cflow_automaton(inputctx* ictx){
   } csis[] = {
     // CSI (\e[)
     { "[E", simple_cb_begin, },
+    { "[200~", paste_begin_cb, },
+    { "[201~", paste_end_cb, },
     { "[<\\N;\\N;\\NM", mouse_press_cb, },
     { "[<\\N;\\N;\\Nm", mouse_release_cb, },
     // technically these must begin with "4" or "8"; enforce in callbacks
@@ -2018,9 +2117,14 @@ create_inputctx(tinfo* ti, FILE* infp, int lmargin, int tmargin, int rmargin,
   bool sent_queries = (ti->ttyfd >= 0) ? true : false;
   inputctx* i = malloc(sizeof(*i));
   if(i){
+    i->cellgeom = (cellgeometry){0};
+    i->mouse_rows = ti->dimy;
+    i->mouse_cols = ti->dimx;
+    i->mouse_celly = ti->cellpxy;
+    i->mouse_cellx = ti->cellpxx;
     i->csize = 64;
     if( (i->csrs = malloc(sizeof(*i->csrs) * i->csize)) ){
-      i->isize = BUFSIZ;
+      i->isize = NCINPUT_QUEUE_SLOTS;
       if( (i->inputs = malloc(sizeof(*i->inputs) * i->isize)) ){
         if(pthread_mutex_init(&i->ilock, NULL) == 0){
           if(pthread_condmonotonic_init(&i->icond) == 0){
@@ -2030,13 +2134,17 @@ create_inputctx(tinfo* ti, FILE* infp, int lmargin, int tmargin, int rmargin,
                   if( (i->initdata = malloc(sizeof(*i->initdata))) ){
                     // readypipes is a wake handle too: on Windows nothing ever
                     // drains it (see internal_get()), so a real pipe would fill
-                    // its BUFSIZ buffer and then block mark_pipe_ready forever.
+                    // its buffer and then block mark_pipe_ready forever.
                     if(getwakepipes(i->readypipes) == 0){
                       if(getwakepipes(i->ipipes) == 0){
                         memset(&i->amata, 0, sizeof(i->amata));
                         if(prep_special_keys(i) == 0){
                           if(set_fd_nonblocking(i->stdinfd, 1, &ti->stdio_blocking_save) == 0){
-                            i->termfd = tty_check(i->stdinfd) ? -1 : get_tty_fd(infp);
+                            // (fork) pollable and nonblocking: see get_tty_input_fd()
+                            i->termselect = false;
+                            i->termfd = tty_check(i->stdinfd) ? -1
+                                        : get_tty_input_fd(&i->termselect);
+                            i->termdead = false;
                             memset(i->initdata, 0, sizeof(*i->initdata));
                             if(sent_queries){
                               i->coutstanding = 1; // one in initial request set
@@ -2051,6 +2159,12 @@ create_inputctx(tinfo* ti, FILE* infp, int lmargin, int tmargin, int rmargin,
                               i->coutstanding = 0;
                             }
                             i->kittykbd = 0;
+                            memset(&i->w32im, 0, sizeof(i->w32im));
+                            // never assigned on Windows (prep_special_keys is
+                            // a no-op there), and load_ncinput compares ids
+                            // against it: a malloc'd garbage byte would turn
+                            // some key into Backspace.
+                            i->backspace = 0;
                             i->iread = i->iwrite = i->ivalid = 0;
                             i->cread = i->cwrite = i->cvalid = 0;
                             i->initdata_complete = NULL;
@@ -2061,6 +2175,8 @@ create_inputctx(tinfo* ti, FILE* infp, int lmargin, int tmargin, int rmargin,
                             i->initdata_timeout = false;
 #ifdef __MINGW32__
                             i->nokeydown_polls = 0;
+                            fdreader_init(&i->reader);
+                            i->abandoned = false;
                             i->stdinhandle = ti->inhandle;
                             {
                               DWORD cmode;
@@ -2075,6 +2191,7 @@ create_inputctx(tinfo* ti, FILE* infp, int lmargin, int tmargin, int rmargin,
                             i->linesigs = linesigs_enabled;
                             i->tbufvalid = 0;
                             i->midescape = 0;
+                            i->escdeadline = 0;
                             i->lmargin = lmargin;
                             i->tmargin = tmargin;
                             i->rmargin = rmargin;
@@ -2254,17 +2371,23 @@ read_input_nblock(int fd, unsigned char* buf, size_t buflen, int *bufused,
   }
   ssize_t r = read(fd, buf + *bufused, space);
   if(r <= 0){
-    if(r < 0 && (errno != EAGAIN && errno != EBUSY && errno == EWOULDBLOCK)){
-      logwarn("couldn't read from %d (%s)", fd, strerror(errno));
+    // (fork) nothing there after all -- the readiness was stale, or the input
+    // was flushed (TCSAFLUSH) between poll() and read() -- is neither an
+    // error nor the end of the stream. (This test read "errno ==
+    // EWOULDBLOCK", which is never true alongside "errno != EAGAIN" where
+    // the two are equal, so a spurious EAGAIN on stdin ended its input.)
+    if(r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EBUSY
+                 || errno == EINTR)){
+      loginfo("nothing to read from %d (%s)", fd, strerror(errno));
+      return;
+    }
+    if(r < 0){
+      logerror("error reading from %d (%s)", fd, strerror(errno));
     }else{
-      if(r < 0){
-        logerror("error reading from %d (%s)", fd, strerror(errno));
-      }else{
-        logwarn("got EOF on %d for %p", fd, goteof);
-      }
-      if(goteof){
-        *goteof = 1;
-      }
+      logwarn("got EOF on %d for %p", fd, goteof);
+    }
+    if(goteof){
+      *goteof = 1;
     }
     return;
   }
@@ -2283,14 +2406,31 @@ read_input_nblock(int fd, unsigned char* buf, size_t buflen, int *bufused,
 // the readiness/broadcast handoff, exactly as it does for the POSIX reader.
 static void
 read_windows_console(inputctx* ictx){
-  size_t space = sizeof(ictx->ibuf) - ictx->ibufvalid;
+  // the transcoder below may be holding back a record cut off by the previous
+  // read; it is spliced in ahead of these bytes, so leave it room
+  size_t space = sizeof(ictx->ibuf) - ictx->ibufvalid - ictx->w32im.holdlen;
   if(space == 0){
     return;
   }
   DWORD got = 0;
-  if(!ReadFile(ictx->stdinhandle, ictx->ibuf + ictx->ibufvalid,
-               (DWORD)space, &got, NULL)){
-    DWORD err = GetLastError();
+  // (fork) bracketed for stop_inputlayer(): see fdreader.h
+  if(!fdreader_enter_read(&ictx->reader)){
+    return; // stopping: don't start a read nobody will wait for
+  }
+  const BOOL readok = ReadFile(ictx->stdinhandle, ictx->ibuf + ictx->ibufvalid,
+                               (DWORD)space, &got, NULL);
+  const DWORD readerr = readok ? 0 : GetLastError();
+  switch(fdreader_leave_read(&ictx->reader)){
+    case FDREADER_OWNED: // stop_inputlayer() gave up and returned: we're alone
+      ictx->abandoned = true;
+      return;
+    case FDREADER_STOP: // stopping: whatever arrived is not wanted
+      return;
+    case FDREADER_DELIVER:
+      break;
+  }
+  if(!readok){
+    DWORD err = readerr;
     // a cancelled read is our own shutdown, not a broken stream
     if(err == ERROR_OPERATION_ABORTED){
       return;
@@ -2312,6 +2452,22 @@ read_windows_console(inputctx* ictx){
     return;
   }
   ictx->ibufvalid += (int)got;
+  // Rewrite win32-input-mode records into the kitty sequences the automaton
+  // already decodes (win32input.h). The whole valid region is rescanned, not
+  // just the new bytes: a read can end on the ESC or ESC [ of a record, which
+  // the automaton keeps at the front of the buffer as a pending escape, and
+  // only the rescan sees it whole. Whenever anything was rewritten the walk
+  // is restarted from the first byte, since the automaton may have been
+  // part-way through exactly such a prefix. Restarting is always sound -- an
+  // unfinished escape is never consumed, so its bytes are all still here and
+  // a walk is deterministic from its ESC -- and only happens when the buffer
+  // actually changed.
+  if(w32im_transcode(ictx->ibuf, &ictx->ibufvalid, (int)got, &ictx->w32im)){
+    ictx->amata.used = 0;
+    ictx->amata.state = 0;
+    ictx->amata.instring = 0;
+    ictx->midescape = 0;
+  }
 }
 #endif
 
@@ -2319,6 +2475,19 @@ read_windows_console(inputctx* ictx){
 static inline bool
 ictx_independent_p(const inputctx* ictx){
   return ictx->termfd >= 0;
+}
+
+// (fork) Forget a walk that is being given up on -- its bytes replayed as
+// input, or found invalid -- so that the next escape is walked from its own
+// first byte. process_escape() resumes from amata.used, and a stale count
+// (or a stale instring, which stops an ESC from restarting the walk) made it
+// misparse whatever came next: Alt+x as Escape then x, Up as ESC [ A, and an
+// assertion failure in debug builds.
+static inline void
+reset_escape_walk(inputctx* ictx){
+  ictx->amata.used = 0;
+  ictx->amata.state = 0;
+  ictx->amata.instring = 0;
 }
 
 static inline void
@@ -2388,6 +2557,32 @@ process_escape(inputctx* ictx, const unsigned char* buf, int buflen){
   return -ictx->amata.used;
 }
 
+// (fork) Is there no room in the ncinput queue for what we would produce
+// next? When there is none the callers stop consuming and leave the bytes
+// in their buffer, block_on_input() stops reading and sleeps until the
+// client drains a slot (notcurses_get() signals ipipes on the full-to-not-
+// full edge), and processing resumes where it stopped. Loading anyway
+// would make load_ncinput() drop the event, which is how a large paste on
+// Windows, whose queue used to be BUFSIZ = 512 slots, lost most of itself.
+//
+// The one exception is a client blocked in a cursor location request: it
+// cannot drain the queue until its report arrives, and the report is in
+// this same byte stream, so while one is outstanding we keep processing
+// and accept that load_ncinput() may drop keys, as it always did.
+static bool
+ncinput_queue_full(inputctx* ictx){
+  pthread_mutex_lock(&ictx->ilock);
+  const bool full = ictx->ivalid == ictx->isize;
+  pthread_mutex_unlock(&ictx->ilock);
+  if(!full){
+    return false;
+  }
+  pthread_mutex_lock(&ictx->clock);
+  const bool waiting = ictx->coutstanding > 0;
+  pthread_mutex_unlock(&ictx->clock);
+  return !waiting;
+}
+
 // process as many control sequences from |buf|, having |bufused| bytes,
 // as we can. this text needn't be valid UTF-8. this is always called on
 // tbuf; if we find bulk data here, we need replay it into ibuf (assuming
@@ -2396,6 +2591,9 @@ static void
 process_escapes(inputctx* ictx, unsigned char* buf, int* bufused){
   int offset = 0;
   while(*bufused > 0){
+    if(ncinput_queue_full(ictx)){
+      break; // (fork) see ncinput_queue_full(); the rest waits in the buffer
+    }
     int consumed = process_escape(ictx, buf + offset, *bufused);
     // negative |consumed| means either that we're not sure whether it's an
     // escape, or it definitely is not.
@@ -2404,6 +2602,7 @@ process_escapes(inputctx* ictx, unsigned char* buf, int* bufused){
       // replay it to the bulk input buffer; our automaton will have been reset.
       if(!ictx->midescape){
         consumed = -consumed;
+        reset_escape_walk(ictx); // (fork) the walk is over
         int available = sizeof(ictx->ibuf) - ictx->ibufvalid;
         if(available){
           if(available > consumed){
@@ -2413,10 +2612,12 @@ process_escapes(inputctx* ictx, unsigned char* buf, int* bufused){
           memcpy(ictx->ibuf + ictx->ibufvalid, buf + offset, available);
           ictx->ibufvalid += available;
         }
-        offset += consumed;
         ictx->midescape = 0;
-        *bufused -= consumed;
-        assert(0 <= *bufused);
+        // (fork) consumed below, once: this branch used to advance offset
+        // and *bufused by |consumed| itself as well, driving *bufused (that
+        // is, tbufvalid) negative on the first key typed at the terminal
+        // with stdin redirected -- an assertion failure in debug builds, and
+        // in release a read() to before tbuf on the next pass
       }else{
         break;
       }
@@ -2454,12 +2655,11 @@ process_input(const unsigned char* buf, int buflen, ncinput* ni){
     logwarn("utf8 character (%dB) broken across read", cpointlen);
     return 0; // need read more data; we don't have the complete character
   }
-  wchar_t w;
-  mbstate_t mbstate = {0};
-//fprintf(stderr, "CANDIDATE: %d cpointlen: %zu cpoint: %d\n", candidate, cpointlen, cpoint[cpointlen]);
-  // FIXME how the hell does this work with 16-bit wchar_t?
-  size_t r = mbrtowc(&w, (const char*)buf, cpointlen, &mbstate);
-  if(r == (size_t)-1 || r == (size_t)-2){
+  // a whole code point: through a 16-bit wchar_t (MinGW), every non-BMP
+  // character typed or pasted arrived as U+FFFD
+  uint32_t w;
+  size_t r = nc_mbrtoc32(&w, (const char*)buf, cpointlen);
+  if(r == (size_t)-1){
     logerror("invalid utf8 prefix (%dB) on input", cpointlen);
     return -1;
   }
@@ -2489,13 +2689,7 @@ static void
 process_bulk(inputctx* ictx, unsigned char* buf, int* bufused){
   int offset = 0;
   while(*bufused){
-    bool noroom = false;
-    pthread_mutex_lock(&ictx->ilock);
-    if(ictx->ivalid == ictx->isize){
-      noroom = true;
-    }
-    pthread_mutex_unlock(&ictx->ilock);
-    if(noroom){
+    if(ncinput_queue_full(ictx)){
       break;
     }
     int consumed = process_ncinput(ictx, buf + offset, *bufused);
@@ -2511,28 +2705,97 @@ process_bulk(inputctx* ictx, unsigned char* buf, int* bufused){
   }
 }
 
+static uint64_t
+monotonic_ns(void){
+  struct timespec ts;
+  if(clock_gettime(CLOCK_MONOTONIC, &ts)){
+    return 0;
+  }
+  return (uint64_t)ts.tv_sec * UINT64_C(1000000000) + (uint64_t)ts.tv_nsec;
+}
+
+// (fork) Should the |used| bytes of an unfinished escape, which reach the end
+// of what has been read, wait for more instead of being replayed as input?
+//
+// A terminal writes each report, and each keypress, in one go, but whatever
+// carries it here -- a pty under load, ssh, ConPTY, a multiplexer -- can
+// still deliver it in pieces, and the rule that an escape must arrive as a
+// single unit then replays the first piece as keypresses (ESC, '[', digits)
+// into whatever has focus. Two bytes or fewer can be a keypress -- Escape, or
+// Alt with a key whose byte begins a sequence (Alt+[, Alt+O, ...) -- and must
+// not be kept waiting, so those keep the old rule. Three or more bytes still
+// on the trie can only be the start of a sequence the terminal generated, so
+// the rest is waited for until NCINPUT_ESCAPE_HOLD_MS after the piece was
+// first seen, and then the piece is replayed as before. A key typed in the
+// meantime does not wait: the first byte that cannot continue the sequence
+// ends it, and the whole lot is replayed at once.
+static bool
+hold_partial_escape(inputctx* ictx, int used){
+  const bool held = ictx->escdeadline != 0;
+  if(ncinput_hold_escape(used, &ictx->escdeadline, monotonic_ns())){
+    if(!held){
+      loginfo("holding a %dB partial escape for its remainder", used);
+    }
+    return true;
+  }
+  if(held){
+    logwarn("replaying a %dB partial escape; its remainder never came", used);
+  }
+  return false;
+}
+
+// (fork) Nanoseconds left before a held partial escape is given up on, for
+// block_on_input()'s wait; 0 if none is held or its time is up.
+static uint64_t
+escape_hold_remaining(const inputctx* ictx){
+  if(ictx->escdeadline == 0){
+    return 0;
+  }
+  const uint64_t now = monotonic_ns();
+  return now < ictx->escdeadline ? ictx->escdeadline - now : 0;
+}
+
 // process as much mixed input as we can. we might find UTF-8 bulk input and
 // control sequences mixed (though each individual character/sequence ought be
 // contiguous). known control sequences are removed for internal processing.
 // everything else will be handed up to the client (assuming it to be valid
-// UTF-8).
+// UTF-8). |canhold| allows an unfinished escape at the end of |buf| to be
+// held for the rest of its bytes (hold_partial_escape()); only the input
+// thread's own ibuf, which persists between reads, can do that.
 static void
-process_melange(inputctx* ictx, const unsigned char* buf, int* bufused){
+process_melange(inputctx* ictx, const unsigned char* buf, int* bufused,
+                bool canhold){
   int offset = 0;
   int origlen = *bufused;
   while(*bufused){
+    if(ncinput_queue_full(ictx)){
+      break; // (fork) see ncinput_queue_full(); the rest waits in the buffer
+    }
     logdebug("input %d (%u)/%d [0x%02x] (%c)", offset, ictx->amata.used,
              *bufused, buf[offset], isprint(buf[offset]) ? buf[offset] : ' ');
     int consumed = 0;
     if(buf[offset] == NCKEY_ESC){
       consumed = process_escape(ictx, buf + offset, *bufused);
-      if(consumed < 0){
-        if(ictx->midescape){
-          if(*bufused != -consumed || *bufused == origlen){
-            // not at the end; treat it as input. no need to move between
-            // buffers; simply ensure we process it as input, and don't mark
-            // anything as consumed.
-            ictx->midescape = 0;
+      if(consumed < 0 && ictx->midescape && canhold
+         && hold_partial_escape(ictx, -consumed)){
+        // (fork) the start of a sequence whose rest is still on its way;
+        // midescape stays set, and block_on_input() waits for it
+      }else{
+        if(canhold){
+          ictx->escdeadline = 0; // finished, invalid, or being replayed
+        }
+        if(consumed < 0){
+          if(ictx->midescape){
+            if(*bufused != -consumed || *bufused == origlen){
+              // not at the end; treat it as input. no need to move between
+              // buffers; simply ensure we process it as input, and don't mark
+              // anything as consumed.
+              ictx->midescape = 0;
+            }
+          }
+          if(!ictx->midescape){
+            // (fork) replayed as input from here: the walk is over
+            reset_escape_walk(ictx);
           }
         }
       }
@@ -2579,7 +2842,7 @@ process_ibuf(inputctx* ictx){
       process_bulk(ictx, ictx->ibuf, &ictx->ibufvalid);
     }else{
       int valid = ictx->ibufvalid;
-      process_melange(ictx, ictx->ibuf, &ictx->ibufvalid);
+      process_melange(ictx, ictx->ibuf, &ictx->ibufvalid, true);
       // move any leftovers to the front
       if(ictx->ibufvalid){
         memmove(ictx->ibuf, ictx->ibuf + valid - ictx->ibufvalid, ictx->ibufvalid);
@@ -2592,7 +2855,7 @@ process_ibuf(inputctx* ictx){
 }
 
 int ncinput_shovel(inputctx* ictx, const void* buf, int len){
-  process_melange(ictx, buf, &len);
+  process_melange(ictx, buf, &len, false);
   if(len){
     logwarn("dropping %d byte%s", len, len == 1 ? "" : "s");
     inc_input_errors(ictx);
@@ -2600,25 +2863,77 @@ int ncinput_shovel(inputctx* ictx, const void* buf, int len){
   return 0;
 }
 
+#ifdef __APPLE__
+// (fork) poll() over |pfds| for POLLIN, done with select(), which (unlike
+// poll()) can watch macOS's /dev/tty: see get_tty_input_fd(). Every fd must
+// be below FD_SETSIZE.
+static int
+poll_with_select(struct pollfd* pfds, int count, int timeoutms){
+  fd_set rfds;
+  FD_ZERO(&rfds);
+  int maxfd = -1;
+  for(int i = 0 ; i < count ; ++i){
+    pfds[i].revents = 0;
+    FD_SET(pfds[i].fd, &rfds);
+    if(pfds[i].fd > maxfd){
+      maxfd = pfds[i].fd;
+    }
+  }
+  struct timeval tv;
+  struct timeval* ptv = NULL;
+  if(timeoutms >= 0){
+    tv.tv_sec = timeoutms / 1000;
+    tv.tv_usec = (timeoutms % 1000) * 1000;
+    ptv = &tv;
+  }
+  const int r = select(maxfd + 1, &rfds, NULL, NULL, ptv);
+  if(r <= 0){
+    return r;
+  }
+  int ready = 0;
+  for(int i = 0 ; i < count ; ++i){
+    if(FD_ISSET(pfds[i].fd, &rfds)){
+      pfds[i].revents = POLLIN;
+      ++ready;
+    }
+  }
+  return ready;
+}
+#endif
+
 // here, we always block for an arbitrarily long time, or not at all,
-// doing the latter only when ictx->midescape is set. |rtfd| and/or |rifd|
+// doing the latter only when ictx->midescape is set. (fork) The exception is
+// a partial escape being held for its remainder (hold_partial_escape()):
+// then we block until its deadline at the latest. |rtfd| and/or |rifd|
 // are set high iff they are ready for reading, and otherwise cleared.
 static int
 block_on_input(inputctx* ictx, unsigned* rtfd, unsigned* rifd){
   logtrace("blocking on input availability");
   *rtfd = *rifd = 0;
   unsigned nonblock = ictx->midescape;
+  uint64_t holdns = 0; // how long to wait when nonblock is set
   if(nonblock){
-    loginfo("nonblocking read to check for completion");
+    holdns = escape_hold_remaining(ictx);
+    loginfo("read to check for completion (waiting %" PRIu64 "ns)", holdns);
     ictx->midescape = 0;
   }
+  // in milliseconds, rounded up so as not to wake just short of the deadline
+  const int holdms = (int)((holdns + 999999) / 1000000);
+  // (fork) With the ncinput queue full there is nothing useful to read: the
+  // buffers would only fill up, and on a redirected stdin the blocking
+  // ReadFile() would trap this thread with bytes still waiting in ibuf. So
+  // the input descriptors leave the wait set until the client drains a slot
+  // and signals ipipes.
+  const bool queuefull = ncinput_queue_full(ictx);
 #ifdef __MINGW32__
-  int timeoutms = nonblock ? 0 : -1;
+  int timeoutms = nonblock ? holdms : -1;
   DWORD ncount = 0;
   HANDLE handles[2];
   DWORD stdinidx = (DWORD)-1;
-  if(!ictx->stdineof){
-    if(ictx->ibufvalid != sizeof(ictx->ibuf)){
+  if(!ictx->stdineof && !queuefull){
+    // full means no room for a read, counting the record the transcoder is
+    // holding back (read_windows_console() splices it in first)
+    if((size_t)(ictx->ibufvalid + ictx->w32im.holdlen) != sizeof(ictx->ibuf)){
       stdinidx = ncount;
       handles[ncount++] = ictx->stdinhandle;
     }
@@ -2647,6 +2962,11 @@ block_on_input(inputctx* ictx, unsigned* rtfd, unsigned* rifd){
     // CRT read() for one of those records blocks until a later key-down. That
     // makes the byte stream appear one physical keypress behind (most visibly
     // as an Enter which only takes effect after the next Enter).
+    //
+    // With win32-input-mode enabled (win32input.h) conhost translates every
+    // keyboard record, key-ups included, into synthesized key-down character
+    // records at write time, so keyboard traffic always satisfies this check
+    // and only focus/menu records still fall through to the backoff below.
     //
     // Inspect, but never consume, the console queue: the CRT byte reader must
     // remain its sole owner. It will discard the preceding non-byte records
@@ -2699,7 +3019,7 @@ block_on_input(inputctx* ictx, unsigned* rtfd, unsigned* rifd){
   // otherwise indefinitely-blocked input thread.
   struct pollfd pfds[3];
   int pfdcount = 0;
-  if(!ictx->stdineof){
+  if(!ictx->stdineof && !queuefull){
     if(ictx->ibufvalid != sizeof(ictx->ibuf)){
       pfds[pfdcount].fd = ictx->stdinfd;
       pfds[pfdcount].events = inevents;
@@ -2711,7 +3031,7 @@ block_on_input(inputctx* ictx, unsigned* rtfd, unsigned* rifd){
   pfds[pfdcount].events = inevents;
   pfds[pfdcount].revents = 0;
   ++pfdcount;
-  if(ictx->termfd >= 0){
+  if(ictx->termfd >= 0 && !ictx->termdead && !queuefull){
     pfds[pfdcount].fd = ictx->termfd;
     pfds[pfdcount].events = inevents;
     pfds[pfdcount].revents = 0;
@@ -2723,16 +3043,39 @@ block_on_input(inputctx* ictx, unsigned* rtfd, unsigned* rifd){
   sigdelset(&smask, SIGCONT);
   sigdelset(&smask, SIGWINCH);
 #ifdef SIGTHR
-  // freebsd uses SIGTHR for thread cancellation; need this to ensure wakeup
-  // on exit (in cancel_and_join()).
+  // freebsd uses SIGTHR for thread cancellation; leave it deliverable, should
+  // anything still cancel this thread (shutdown no longer does: see
+  // stop_inputlayer()).
   sigdelset(&smask, SIGTHR);
 #endif
   int events;
 #if defined(__APPLE__) || defined(__MINGW32__)
-  int timeoutms = nonblock ? 0 : -1;
-  while((events = poll(pfds, pfdcount, timeoutms)) < 0){ // FIXME smask?
+  int timeoutms = nonblock ? holdms : -1;
+#ifdef __APPLE__
+  // (fork) /dev/tty, which poll() can't watch, is watched with select()
+  bool useselect = false;
+  if(ictx->termselect && pfds[pfdcount - 1].fd == ictx->termfd){
+    useselect = true;
+    for(int i = 0 ; i < pfdcount ; ++i){
+      if(pfds[i].fd >= FD_SETSIZE){
+        logerror("fd %d is beyond select(); no longer reading the terminal",
+                 pfds[i].fd);
+        ictx->termdead = true;
+        --pfdcount; // termfd is always last
+        useselect = false;
+        break;
+      }
+    }
+  }
+  while((events = useselect ? poll_with_select(pfds, pfdcount, timeoutms)
+                            : poll(pfds, pfdcount, timeoutms)) < 0){
 #else
-  struct timespec ts = { .tv_sec = 0, .tv_nsec = 0, };
+  while((events = poll(pfds, pfdcount, timeoutms)) < 0){ // FIXME smask?
+#endif
+#else
+  (void)holdms;
+  struct timespec ts = { .tv_sec = (time_t)(holdns / UINT64_C(1000000000)),
+                         .tv_nsec = (long)(holdns % UINT64_C(1000000000)), };
   struct timespec* pts = nonblock ? &ts : NULL;
   while((events = ppoll(pfds, pfdcount, pts, &smask)) < 0){
 #endif
@@ -2751,7 +3094,15 @@ block_on_input(inputctx* ictx, unsigned* rtfd, unsigned* rifd){
       if(pfds[pfdcount].fd == ictx->stdinfd){
         *rifd = 1;
       }else if(pfds[pfdcount].fd == ictx->termfd){
-        *rtfd = 1;
+        if(pfds[pfdcount].revents & POLLNVAL){
+          // (fork) a descriptor poll() can't watch (macOS's /dev/tty, were
+          // get_tty_input_fd() to hand one out) would wake us at once, every
+          // time, forever: stop watching it rather than spin
+          logerror("can't poll terminal fd %d; no longer reading it", ictx->termfd);
+          ictx->termdead = true;
+        }else{
+          *rtfd = 1;
+        }
       }else if(pfds[pfdcount].fd == ictx->ipipes[0]){
         char c;
         while(read(ictx->ipipes[0], &c, sizeof(c)) == 1){
@@ -2775,8 +3126,14 @@ read_inputs_nblock(inputctx* ictx){
   block_on_input(ictx, &rtfd, &rifd);
   // first we read from the terminal, if that's a distinct source.
   if(rtfd){
+    unsigned termeof = 0;
     read_input_nblock(ictx->termfd, ictx->tbuf, sizeof(ictx->tbuf),
-                      &ictx->tbufvalid, NULL);
+                      &ictx->tbufvalid, &termeof);
+    if(termeof){
+      // (fork) hung up or failed: poll()ing it would only spin from here on
+      logerror("terminal input (fd %d) is gone; no longer reading it", ictx->termfd);
+      ictx->termdead = true;
+    }
   }
   // now read bulk, possibly with term escapes intermingled within (if there
   // was not a distinct terminal source).
@@ -2784,6 +3141,9 @@ read_inputs_nblock(inputctx* ictx){
     unsigned eof = ictx->stdineof;
 #ifdef __MINGW32__
     read_windows_console(ictx);
+    if(ictx->abandoned){
+      return; // (fork) nothing here is ours to touch but ictx: see input_thread()
+    }
 #else
     read_input_nblock(ictx->stdinfd, ictx->ibuf, sizeof(ictx->ibuf),
                       &ictx->ibufvalid, &ictx->stdineof);
@@ -2810,6 +3170,19 @@ input_thread(void* vmarshall){
   }
   while(!atomic_load(&ictx->stopping)){
     read_inputs_nblock(ictx);
+#ifdef __MINGW32__
+    if(ictx->abandoned){
+      // (fork) stop_inputlayer() gave up on our read and has returned, and
+      // the terminal state ictx->ti points into may be gone with notcurses:
+      // the context is ours alone now, and is freed here, and that is all.
+      loginfo("abandoned input thread finished");
+      free_inputctx(ictx);
+      return NULL;
+    }
+#endif
+    if(atomic_load(&ictx->stopping)){
+      break; // what was read is for nobody now
+    }
     // process anything we've read
     process_ibuf(ictx);
     if(atomic_exchange(&ictx->initdata_timeout, false)){
@@ -2845,10 +3218,77 @@ int stop_inputlayer(tinfo* ti){
       // no pthread_cancel on windows: ask the thread to stop, then wake it out
       // of its blocking wait via the ipipes event.
       atomic_store(&ti->ictx->stopping, true);
+      fdreader_stop(&ti->ictx->reader); // (fork) no new read: see below
       mark_pipe_ready(ti->ictx->ipipes);
-      ret |= pthread_join(ti->ictx->tid, NULL);
+      // (fork) A redirected stdin -- a pipe whose writer is alive and quiet --
+      // leaves the thread in a blocking ReadFile() that no event reaches, so
+      // the join would never return. Cancel that read (the thread drops
+      // whatever it brings, its stop having been asked for), and keep
+      // cancelling until the thread has gone: a cancel issued before the read
+      // began cancels nothing. Cancels are aimed only while the thread is in
+      // that read (fdreader.h): CancelIoEx() on stdin's handle, which also
+      // reaches console reads, and CancelSynchronousIo() on the thread.
+      //
+      // A read can still refuse to end, so after FDREADER_STOP_MS this gives
+      // up rather than hang notcurses_stop(): the thread is detached and the
+      // context abandoned to it -- the read is still using its buffer -- and
+      // it frees the context, touching nothing else, if the read ever
+      // returns. stdin may then lose the input that read takes.
+      inputctx* ictx = ti->ictx;
+      const pthread_t tid = ictx->tid;
+      HANDLE th = pthread_gethandle(tid);
+      const ULONGLONG start = GetTickCount64();
+      bool warned = false;
+      for(;;){
+        if(fdreader_reading(&ictx->reader)){
+          if(ictx->stdinhandle && ictx->stdinhandle != INVALID_HANDLE_VALUE){
+            CancelIoEx(ictx->stdinhandle, NULL);
+          }
+          CancelSynchronousIo(th);
+        }
+        const DWORD w = WaitForSingleObject(th, 20);
+        if(w == WAIT_OBJECT_0){
+          break;
+        }
+        if(w != WAIT_TIMEOUT){
+          // without a handle to wait on, only the join can see it go
+          logerror("couldn't wait on input thread (%lu); joining", GetLastError());
+          break;
+        }
+        if(GetTickCount64() - start >= FDREADER_STOP_MS){
+          if(fdreader_abandon(&ictx->reader)){
+            // from here on the context is the thread's: only tid is used
+            pthread_detach(tid);
+            ti->ictx = NULL;
+            logerror("input thread's read didn't stop within %dms; abandoned "
+                     "it, to free its context if the read ever returns",
+                     FDREADER_STOP_MS);
+            return -1;
+          }
+          if(!warned){ // not in its read: it is on its way out
+            logwarn("input thread still running after %dms; waiting for it",
+                    FDREADER_STOP_MS);
+            warned = true;
+          }
+        }
+      }
+      ret |= pthread_join(tid, NULL);
 #else
-      ret |= cancel_and_join("input", ti->ictx->tid, NULL);
+      // (fork) Asked and woken, as on Windows, rather than cancelled: on
+      // macOS a pthread_cancel() can be lost outright, leaving the thread
+      // asleep in poll() with the cancel pending and notcurses_stop() hung in
+      // the join (caught in the test suite; a second pthread_cancel() frees
+      // it). The thread polls ipipes in every wait and checks 'stopping'
+      // after every one, and holds no lock while it waits. Nothing else can
+      // keep it: every descriptor it reads is nonblocking (stdinfd here in
+      // create_inputctx(), termfd by get_tty_input_fd(), the wake pipes by
+      // getwakepipes()), so a read() never sleeps, and it writes nothing.
+      atomic_store(&ti->ictx->stopping, true);
+      mark_pipe_ready(ti->ictx->ipipes);
+      if(pthread_join(ti->ictx->tid, NULL)){
+        logerror("error joining input thread");
+        ret = -1;
+      }
 #endif
       ret |= set_fd_nonblocking(ti->ictx->stdinfd, ti->stdio_blocking_save, NULL);
       free_inputctx(ti->ictx);

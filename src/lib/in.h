@@ -8,6 +8,8 @@ extern "C" {
 // internal header, not installed
 
 #include <stdio.h>
+#include <stdbool.h>
+#include <stdint.h>
 
 struct tinfo;
 struct inputctx;
@@ -19,6 +21,38 @@ int init_inputlayer(struct tinfo* ti, FILE* infp, int lmargin, int tmargin,
   __attribute__ ((nonnull (1, 2, 7)));
 
 int stop_inputlayer(struct tinfo* ti);
+
+// (fork) How long the input layer waits for the rest of a terminal-generated
+// control sequence that reached it in pieces before replaying the piece it
+// has as keypresses. Only pieces of three or more bytes wait: an Escape, or
+// an Alt-modified key whose byte begins a sequence, is two bytes at most and
+// is delivered at once, as ever. See hold_partial_escape() in in.c.
+#define NCINPUT_ESCAPE_HOLD_MS 100
+
+// (fork) The decision behind NCINPUT_ESCAPE_HOLD_MS, apart from the clock so
+// that it can be tested. An unfinished escape of |used| bytes ends the input
+// read so far; |*deadline| is when the current hold expires (0 if there is
+// none) and |now| the time, both CLOCK_MONOTONIC nanoseconds (a |now| of 0
+// means the clock failed). True to keep waiting for the remainder, starting
+// a hold if there is none; false to replay the bytes as input now.
+static inline bool
+ncinput_hold_escape(int used, uint64_t* deadline, uint64_t now){
+  if(used < 3 || now == 0){
+    return false;
+  }
+  if(*deadline == 0){
+    *deadline = now + UINT64_C(1000000) * NCINPUT_ESCAPE_HOLD_MS;
+    return true;
+  }
+  return now < *deadline;
+}
+
+// Owner-thread geometry polling; never waits for input or paints. Output
+// retains the caller's last valid cell size until a report has arrived.
+int inputlayer_poll_cell_geometry(struct inputctx* ictx, int fd,
+                                  unsigned* y, unsigned* x);
+void inputlayer_set_geometry(struct inputctx* ictx, unsigned rows, unsigned cols,
+                             unsigned y, unsigned x);
 
 int inputready_fd(const struct inputctx* ictx)
   __attribute__ ((nonnull (1)));

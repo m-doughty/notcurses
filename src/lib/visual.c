@@ -88,6 +88,10 @@ static ncvisual* ncvisual_subregion_internal(const ncvisual* src,
 
 int ncvisual_blit_internal(const ncvisual* ncv, int rows, int cols, ncplane* n,
                            const struct blitset* bset, const blitterargs* barg){
+  if(bset->geom == NCBLIT_PIXEL){
+    barg->u.pixel.spx->cellpxy = barg->u.pixel.cellpxy;
+    barg->u.pixel.spx->cellpxx = barg->u.pixel.cellpxx;
+  }
   // Pre-crop the source once here so every backend sees "full source"
   // semantics. leny/lenx==0 fall back to full extent for direct callers.
   unsigned crop_begy = barg->begy;
@@ -1175,8 +1179,15 @@ ncplane* ncvisual_render_pixels(notcurses* nc, ncvisual* ncv, const struct blits
       return NULL;;
     }
   }else{
+    // Kitty recycling allocates a new sprixel with the current pile geometry,
+    // but the plane can still own auxiliary vectors from the previous font.
+    const bool cellgeo_changed = n->sprite->cellpxy != geom->cdimy ||
+                                 n->sprite->cellpxx != geom->cdimx;
     n->sprite = sprixel_recycle(n);
-    if(n->sprite->dimy != geom->rcelly || n->sprite->dimx != geom->rcellx){
+    if(n->sprite == NULL){
+      return NULL;
+    }
+    if(n->sprite->dimy != geom->rcelly || n->sprite->dimx != geom->rcellx || cellgeo_changed){
       destroy_tam(n);
       if((n->tam = create_tam(geom->rcelly, geom->rcellx)) == NULL){
         return NULL;
