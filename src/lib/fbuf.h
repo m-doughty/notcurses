@@ -265,6 +265,32 @@ fbuf_free(fbuf* f){
   }
 }
 
+#ifdef __MINGW32__
+// Frame buffers already contain UTF-8 and terminal protocol bytes. UCRT's
+// text-console path under a UTF-8 locale converts and writes one character
+// at a time, turning a Sixel frame into hundreds of thousands of syscalls.
+// Keep descriptor modes untouched and send the buffer directly instead.
+static inline int
+blocking_write_console(HANDLE handle, const char* buf, size_t buflen){
+  size_t written = 0;
+  while(written < buflen){
+    size_t remaining = buflen - written;
+    DWORD count = remaining > MAXDWORD ? MAXDWORD : (DWORD)remaining;
+    DWORD done = 0;
+    if(!WriteFile(handle, buf + written, count, &done, NULL)){
+      logerror("Error writing console data (%lu)", (unsigned long)GetLastError());
+      return -1;
+    }
+    if(done == 0){
+      logerror("Console write made no progress");
+      return -1;
+    }
+    written += done;
+  }
+  return 0;
+}
+#endif
+
 // write(2) until we've written it all. uses poll(2) to avoid spinning on
 // EAGAIN, at the possible cost of some small latency.
 static inline int
@@ -281,6 +307,13 @@ blocking_write(int fd, const char* buf, size_t buflen){
     logerror("Invalid descriptor %d", fd);
     return -1;
   }
+#ifdef __MINGW32__
+  HANDLE handle = (HANDLE)_get_osfhandle(fd);
+  DWORD mode;
+  if(handle != INVALID_HANDLE_VALUE && GetConsoleMode(handle, &mode)){
+    return blocking_write_console(handle, buf, buflen);
+  }
+#endif
   size_t written = 0;
   while(written < buflen){
     ssize_t w = write(fd, buf + written, buflen - written);

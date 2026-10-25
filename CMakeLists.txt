@@ -906,7 +906,8 @@ install(TARGETS notcurses-tester DESTINATION bin)
 # Geometry lifetime tests call private core functions. Link a separate test
 # against the static core rather than exposing implementation symbols in the
 # shared-library ABI. No multimedia backend or terminal pixel support needed.
-add_executable(notcurses-geometry-tester src/tests/internal/sprixelgeometry.cpp)
+add_executable(notcurses-geometry-tester src/tests/internal/sprixelgeometry.cpp
+  src/tests/internal/sprite-cleanup.cpp)
 target_include_directories(notcurses-geometry-tester PRIVATE
   include src "${CMAKE_REQUIRED_INCLUDES}" "${PROJECT_BINARY_DIR}/include"
   "${TERMINFO_INCLUDE_DIRS}")

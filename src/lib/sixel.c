@@ -1440,8 +1440,10 @@ int sixel_scrub(const ncpile* p, sprixel* s){
   loginfo("%d state %d at %d/%d (%d/%d)", s->id, s->invalidated, s->movedfromy, s->movedfromx, s->dimy, s->dimx);
   int starty = s->movedfromy;
   int startx = s->movedfromx;
-  for(int yy = starty ; yy < starty + (int)s->dimy && yy < (int)p->dimy ; ++yy){
-    for(int xx = startx ; xx < startx + (int)s->dimx && xx < (int)p->dimx ; ++xx){
+  // A moved sprite can begin above or left of the pile. Clip both lower
+  // bounds before indexing the render vector.
+  for(int yy = starty < 0 ? 0 : starty ; yy < starty + (int)s->dimy && yy < (int)p->dimy ; ++yy){
+    for(int xx = startx < 0 ? 0 : startx ; xx < startx + (int)s->dimx && xx < (int)p->dimx ; ++xx){
       int ridx = yy * p->dimx + xx;
       struct crender *r = &p->crender[ridx];
       if(!s->n){

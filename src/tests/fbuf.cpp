@@ -1,5 +1,6 @@
 #include "main.h"
 #include "lib/fbuf.h"
+#include <memory>
 
 TEST_CASE("Fbuf") {
   auto nc_ = testing_notcurses();
@@ -82,3 +83,22 @@ TEST_CASE("Fbuf") {
 
   CHECK(0 == notcurses_stop(nc_));
 }
+
+#ifdef __MINGW32__
+TEST_CASE("ConsoleBufferWrite") {
+  HANDLE read_handle = nullptr, write_handle = nullptr;
+  REQUIRE(CreatePipe(&read_handle, &write_handle, nullptr, 4096));
+  std::unique_ptr<void, decltype(&CloseHandle)> reader(read_handle, CloseHandle);
+  std::unique_ptr<void, decltype(&CloseHandle)> writer(write_handle, CloseHandle);
+  const char bytes[] = "\x1bPq\xc3\xa9\r\n\0\x1b\\";
+  CHECK(0 == blocking_write_console(writer.get(), bytes, sizeof(bytes)));
+  char actual[sizeof(bytes)]{};
+  DWORD count = 0;
+  REQUIRE(ReadFile(reader.get(), actual, sizeof(actual), &count, nullptr));
+  CHECK(count == sizeof(bytes));
+  CHECK(0 == memcmp(actual, bytes, sizeof(bytes)));
+  CHECK(0 == blocking_write_console(writer.get(), bytes, 0));
+  CHECK(-1 == blocking_write_console(INVALID_HANDLE_VALUE, bytes, sizeof(bytes)));
+  CHECK(-1 == blocking_write(-1, bytes, sizeof(bytes)));
+}
+#endif
